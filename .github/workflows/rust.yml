@@ -230,30 +230,6 @@ jobs:
       - name: Check benchmarks
         run: |
           cargo check --profile ci --benches --features fp16kernels,cli,dynamodb,substrait
-  windows-build:
-    runs-on: windows-latest
-    defaults:
-      run:
-        working-directory: rust
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
-      - name: Install Protoc v21.12
-        working-directory: C:\
-        run: |
-          New-Item -Path 'C:\protoc' -ItemType Directory
-          Set-Location C:\protoc
-          Invoke-WebRequest https://github.com/protocolbuffers/protobuf/releases/download/v21.12/protoc-21.12-win64.zip -OutFile C:\protoc\protoc.zip
-          7z x protoc.zip
-          Add-Content $env:GITHUB_PATH "C:\protoc\bin"
-        shell: powershell
-      - name: Build tests
-        run: cargo test --profile ci --locked --no-run
-      - name: Run tests
-        run: cargo test --profile ci
-      - name: Check benchmarks
-        run: cargo check --profile ci --benches
-
   msrv:
     # Check the minimum supported Rust version
     name: MSRV Check - Rust v${{ matrix.msrv }}

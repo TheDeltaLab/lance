@@ -196,7 +196,7 @@ jobs:
   mac:
     timeout-minutes: 45
     name: Python macOS 3.13 ARM
-    runs-on: "warp-macos-14-arm64-6x"
+    runs-on: "macos-14-large"
     defaults:
       run:
         shell: bash

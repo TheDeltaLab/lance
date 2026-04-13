@@ -104,7 +104,7 @@ jobs:
         python-minor-version: ["9"]
         config:
           - target: aarch64-apple-darwin
-            runner: warp-macos-14-arm64-6x
+            runner: macos-14-large
     env:
       MACOSX_DEPLOYMENT_TARGET: 10.15
     steps:

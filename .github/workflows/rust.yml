@@ -121,31 +121,6 @@ jobs:
           files: coverage.codecov
           flags: unittests
           fail_ci_if_error: false
-  linux-arm:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 75
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Setup rust toolchain
-        run: |
-          rustup toolchain install stable
-          rustup default stable
-      - uses: rui314/setup-mold@725a8794d15fc7563f59595bd9556495c0564878 # v1
-      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
-      - name: Install dependencies
-        run: |
-          sudo apt -y -qq update
-          sudo apt install -y protobuf-compiler libssl-dev pkg-config
-      - name: Build tests
-        run: |
-          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc -e slow_tests | sort | uniq | paste -s -d "," -`
-          cargo test --profile ci --locked --features ${ALL_FEATURES} --no-run
-      - name: Start DynamodDB and S3
-        run: docker compose -f docker-compose.yml up -d --wait
-      - name: Run tests
-        run: |
-          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc -e slow_tests | sort | uniq | paste -s -d "," -`
-          cargo test --profile ci --locked --features ${ALL_FEATURES}
   query-integration-tests:
     runs-on: ubuntu-24.04
     timeout-minutes: 75

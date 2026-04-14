@@ -29,12 +29,12 @@ use datafusion_functions::core::expr_ext::FieldAccessor;
 use datafusion_physical_expr::EquivalenceProperties;
 use futures::{FutureExt, Stream, StreamExt, TryStreamExt};
 use lance_arrow::{RecordBatchExt, SchemaExt};
-use lance_core::utils::tokio::get_num_compute_intensive_cpus;
+use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_in_current_span};
+use lance_core::utils::tracing::FutureTracingExt;
 use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID_FIELD};
 use lance_file::reader::FileReaderOptions;
 use lance_io::ReadBatchParams;
 use lance_table::format::Fragment;
-use tracing::Instrument;
 
 use crate::Error;
 use crate::dataset::fragment::FragReadConfig;
@@ -228,7 +228,7 @@ impl ExecutionPlan for LancePushdownScanExec {
 
                 frag_scanner.scan().await
             }
-            .in_current_span()
+            .future_in_current_span()
         });
 
         let batch_stream = batch_stream
@@ -354,9 +354,8 @@ impl FragmentScanner {
             })
             .map(move |(batch_id, predicate)| {
                 let scanner_ref = scanner.clone();
-                tokio::task::spawn(
-                    async move { scanner_ref.read_batch(batch_id, predicate).await }
-                        .in_current_span(),
+                spawn_in_current_span(
+                    async move { scanner_ref.read_batch(batch_id, predicate).await },
                 )
                 .map(|res| match res {
                     Ok(Ok(batch)) => Ok(batch),

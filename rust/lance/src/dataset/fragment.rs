@@ -24,8 +24,8 @@ use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt, join, stream};
 use lance_arrow::{RecordBatchExt, SchemaExt};
 use lance_core::datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions};
 use lance_core::utils::deletion::DeletionVector;
-use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::utils::tracing::StreamTracingExt;
+use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_in_current_span};
+use lance_core::utils::tracing::{FutureTracingExt, StreamTracingExt};
 use lance_core::{Error, Result, cache::CacheKey, datatypes::Schema};
 use lance_core::{
     ROW_ADDR, ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION_FIELD, ROW_ID, ROW_ID_FIELD,
@@ -49,7 +49,6 @@ use lance_table::utils::stream::{
     ReadBatchFutStream, ReadBatchTask, ReadBatchTaskStream, RowIdAndDeletesConfig,
     wrap_with_row_id_and_delete,
 };
-use tracing::Instrument;
 
 use self::write::FragmentCreateBuilder;
 
@@ -150,7 +149,7 @@ fn ranges_to_tasks(
             let num_rows = range.end - range.start;
             let reader = reader.clone();
             let projection = projection.clone();
-            let task = tokio::task::spawn(async move {
+            let task = spawn_in_current_span(async move {
                 previous_read_batch(
                     &reader,
                     &ReadBatchParams::Range(range.clone()),
@@ -159,12 +158,8 @@ fn ranges_to_tasks(
                 )
                 .await
             })
-            .map(|task_out| task_out.unwrap())
-            .boxed();
-            ReadBatchTask {
-                task,
-                num_rows: num_rows as u32,
-            }
+            .map(|task_out| task_out.unwrap());
+            ReadBatchTask::from_future(task, num_rows as u32)
         })
         .boxed()
 }
@@ -253,12 +248,8 @@ impl GenericFileReader for V1Reader {
         let indices_vec = indices.to_vec();
         let reader = self.reader.clone();
         // In the new path the row id is added by the fragment and not the file
-        let task_fut = async move { reader.take(&indices_vec, projection.as_ref()).await }.boxed();
-        let task = std::future::ready(ReadBatchTask {
-            task: task_fut,
-            num_rows: indices.len() as u32,
-        })
-        .boxed();
+        let task_fut = async move { reader.take(&indices_vec, projection.as_ref()).await };
+        let task = std::future::ready(ReadBatchTask::from_future(task_fut, indices.len() as u32));
         Ok(futures::stream::once(task).boxed())
     }
 
@@ -346,12 +337,10 @@ mod v2_adapter {
                     Some(projection),
                     FilterExpression::no_filter(),
                 )?
-                .map(|v2_task| ReadBatchTask {
-                    task: v2_task.task.map_err(Error::from).in_current_span().boxed(),
-                    num_rows: v2_task.num_rows,
+                .map(|v2_task| {
+                    ReadBatchTask::from_future(v2_task.task.map_err(Error::from), v2_task.num_rows)
                 })
-                .stream_in_current_span()
-                .boxed())
+                .boxed_stream_in_current_span())
         }
 
         fn read_ranges_tasks(
@@ -373,12 +362,10 @@ mod v2_adapter {
                     Some(projection),
                     FilterExpression::no_filter(),
                 )?
-                .map(|v2_task| ReadBatchTask {
-                    task: v2_task.task.map_err(Error::from).in_current_span().boxed(),
-                    num_rows: v2_task.num_rows,
+                .map(|v2_task| {
+                    ReadBatchTask::from_future(v2_task.task.map_err(Error::from), v2_task.num_rows)
                 })
-                .stream_in_current_span()
-                .boxed())
+                .boxed_stream_in_current_span())
         }
 
         fn read_all_tasks(
@@ -399,12 +386,10 @@ mod v2_adapter {
                     Some(projection),
                     FilterExpression::no_filter(),
                 )?
-                .map(|v2_task| ReadBatchTask {
-                    task: v2_task.task.map_err(Error::from).in_current_span().boxed(),
-                    num_rows: v2_task.num_rows,
+                .map(|v2_task| {
+                    ReadBatchTask::from_future(v2_task.task.map_err(Error::from), v2_task.num_rows)
                 })
-                .stream_in_current_span()
-                .boxed())
+                .boxed_stream_in_current_span())
         }
 
         fn take_all_tasks(
@@ -439,12 +424,10 @@ mod v2_adapter {
                     Some(projection),
                     FilterExpression::no_filter(),
                 )?
-                .map(|v2_task| ReadBatchTask {
-                    task: v2_task.task.map_err(Error::from).in_current_span().boxed(),
-                    num_rows: v2_task.num_rows,
+                .map(|v2_task| {
+                    ReadBatchTask::from_future(v2_task.task.map_err(Error::from), v2_task.num_rows)
                 })
-                .stream_in_current_span()
-                .boxed())
+                .boxed_stream_in_current_span())
         }
 
         fn storage_stats(&self) -> Vec<(u32, u64)> {
@@ -545,10 +528,8 @@ impl GenericFileReader for NullReader {
             let num_rows = remaining_rows.min(batch_size as u64) as usize;
             remaining_rows -= num_rows as u64;
             let batch = Self::batch(projection.clone(), num_rows);
-            let task = ReadBatchTask {
-                task: futures::future::ready(Ok(batch)).boxed(),
-                num_rows: num_rows as u32,
-            };
+            let task =
+                ReadBatchTask::from_future(futures::future::ready(Ok(batch)), num_rows as u32);
             Some(task)
         });
 
@@ -2335,10 +2316,7 @@ impl FragmentReader {
                 .map(move |offset| {
                     let num_rows = (batch_size as usize).min(selected_rows - offset);
                     let batch = RecordBatch::from(StructArray::new_empty_fields(num_rows, None));
-                    ReadBatchTask {
-                        task: std::future::ready(Ok(batch)).boxed(),
-                        num_rows: num_rows as u32,
-                    }
+                    ReadBatchTask::from_future(std::future::ready(Ok(batch)), num_rows as u32)
                 });
             stream::iter(tasks).boxed()
         } else {
@@ -2391,11 +2369,9 @@ impl FragmentReader {
                                 .project_by_schema(&output_schema)
                                 .map_err(Error::from)
                         })
-                        .in_current_span()
-                        .boxed()
+                        .boxed_in_current_span()
                 })
-                .stream_in_current_span()
-                .boxed(),
+                .boxed_stream_in_current_span(),
         )
     }
 
@@ -2494,10 +2470,7 @@ impl FragmentReader {
                     let num_rows = (batch_size as u64).min(num_requested_rows - offset);
                     let batch =
                         RecordBatch::from(StructArray::new_empty_fields(num_rows as usize, None));
-                    ReadBatchTask {
-                        task: std::future::ready(Ok(batch)).boxed(),
-                        num_rows: num_rows as u32,
-                    }
+                    ReadBatchTask::from_future(std::future::ready(Ok(batch)), num_rows as u32)
                 });
             stream::iter(tasks).boxed()
         } else {
@@ -2546,11 +2519,9 @@ impl FragmentReader {
                                 .project_by_schema(&output_schema)
                                 .map_err(Error::from)
                         })
-                        .in_current_span()
-                        .boxed()
+                        .boxed_in_current_span()
                 })
-                .stream_in_current_span()
-                .boxed(),
+                .boxed_stream_in_current_span(),
         )
     }
 

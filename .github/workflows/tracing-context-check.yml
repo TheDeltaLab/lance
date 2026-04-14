@@ -1,0 +1,51 @@
+name: Tracing context policy
+
+on:
+  push:
+    branches:
+      - main
+      - release/**
+    paths:
+      - ci/check_tracing_context.py
+      - .github/workflows/tracing-context-check.yml
+      - rust/lance-encoding/src/decoder.rs
+      - rust/lance-table/src/utils/stream.rs
+      - rust/lance/src/utils/future.rs
+      - rust/lance/src/dataset/fragment.rs
+      - rust/lance/src/io/exec/filtered_read.rs
+      - rust/lance/src/io/exec/scan.rs
+      - rust/lance/src/io/exec/pushdown_scan.rs
+      - rust/lance-core/src/utils/tokio.rs
+      - rust/lance-core/src/utils/tracing.rs
+  pull_request:
+    branches:
+      - main
+      - release/**
+    paths:
+      - ci/check_tracing_context.py
+      - .github/workflows/tracing-context-check.yml
+      - rust/lance-encoding/src/decoder.rs
+      - rust/lance-table/src/utils/stream.rs
+      - rust/lance/src/utils/future.rs
+      - rust/lance/src/dataset/fragment.rs
+      - rust/lance/src/io/exec/filtered_read.rs
+      - rust/lance/src/io/exec/scan.rs
+      - rust/lance/src/io/exec/pushdown_scan.rs
+      - rust/lance-core/src/utils/tokio.rs
+      - rust/lance-core/src/utils/tracing.rs
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Check tracing context policy
+        run: python3 ci/check_tracing_context.py

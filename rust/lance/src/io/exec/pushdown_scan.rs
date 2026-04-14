@@ -359,10 +359,10 @@ impl FragmentScanner {
                         .in_current_span(),
                 )
                 .map(|res| match res {
-                        Ok(Ok(batch)) => Ok(batch),
-                        Ok(Err(err)) => Err(err),
-                        Err(join_err) => Err(DataFusionError::ExecutionJoin(Box::new(join_err))),
-                    })
+                    Ok(Ok(batch)) => Ok(batch),
+                    Ok(Err(err)) => Err(err),
+                    Err(join_err) => Err(DataFusionError::ExecutionJoin(Box::new(join_err))),
+                })
             });
 
         let stream = if ordered_output {

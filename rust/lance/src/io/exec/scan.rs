@@ -382,22 +382,20 @@ impl LanceStream {
         let batches = if config.ordered_output {
             let readers = stream::iter(file_fragments)
                 .map(move |file_fragment| {
-                    Ok(
-                        open_file(
-                            file_fragment,
-                            project_schema.clone(),
-                            FragReadConfig::default()
-                                .with_row_id(config.with_row_id)
-                                .with_row_address(config.with_row_address)
-                                .with_row_last_updated_at_version(
-                                    config.with_row_last_updated_at_version,
-                                )
-                                .with_row_created_at_version(config.with_row_created_at_version),
-                            config.with_make_deletions_null,
-                            None,
-                        )
-                        .in_current_span(),
+                    Ok(open_file(
+                        file_fragment,
+                        project_schema.clone(),
+                        FragReadConfig::default()
+                            .with_row_id(config.with_row_id)
+                            .with_row_address(config.with_row_address)
+                            .with_row_last_updated_at_version(
+                                config.with_row_last_updated_at_version,
+                            )
+                            .with_row_created_at_version(config.with_row_created_at_version),
+                        config.with_make_deletions_null,
+                        None,
                     )
+                    .in_current_span())
                 })
                 .try_buffered(fragment_readahead);
             let tasks = readers.and_then(move |reader| {
@@ -418,22 +416,20 @@ impl LanceStream {
         } else {
             let readers = stream::iter(file_fragments)
                 .map(move |file_fragment| {
-                    Ok(
-                        open_file(
-                            file_fragment,
-                            project_schema.clone(),
-                            FragReadConfig::default()
-                                .with_row_id(config.with_row_id)
-                                .with_row_address(config.with_row_address)
-                                .with_row_last_updated_at_version(
-                                    config.with_row_last_updated_at_version,
-                                )
-                                .with_row_created_at_version(config.with_row_created_at_version),
-                            config.with_make_deletions_null,
-                            None,
-                        )
-                        .in_current_span(),
+                    Ok(open_file(
+                        file_fragment,
+                        project_schema.clone(),
+                        FragReadConfig::default()
+                            .with_row_id(config.with_row_id)
+                            .with_row_address(config.with_row_address)
+                            .with_row_last_updated_at_version(
+                                config.with_row_last_updated_at_version,
+                            )
+                            .with_row_created_at_version(config.with_row_created_at_version),
+                        config.with_make_deletions_null,
+                        None,
                     )
+                    .in_current_span())
                 })
                 .try_buffered(fragment_readahead);
             let tasks = readers.and_then(move |reader| {

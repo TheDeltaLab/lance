@@ -2391,8 +2391,10 @@ impl FragmentReader {
                                 .project_by_schema(&output_schema)
                                 .map_err(Error::from)
                         })
+                        .in_current_span()
                         .boxed()
                 })
+                .stream_in_current_span()
                 .boxed(),
         )
     }
@@ -2544,8 +2546,10 @@ impl FragmentReader {
                                 .project_by_schema(&output_schema)
                                 .map_err(Error::from)
                         })
+                        .in_current_span()
                         .boxed()
                 })
+                .stream_in_current_span()
                 .boxed(),
         )
     }

@@ -36,6 +36,7 @@ use lance_core::utils::mask::{
     RowAddrMask, RowAddrSelection, RowAddrTreeMap, bitmap_to_ranges, ranges_to_bitmap,
 };
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
+use lance_core::utils::tracing::StreamTracingExt;
 use lance_core::{Error, Result, datatypes::Projection};
 use lance_datafusion::planner::Planner;
 use lance_datafusion::utils::{
@@ -1127,13 +1128,15 @@ impl FilteredReadStream {
                             global_metrics.ranges_scanned.add(additional_ranges);
                         }
                     })
+                    .in_current_span()
                     .boxed()
             })
             .zip(futures::stream::repeat((
                 physical_filter.clone(),
                 output_schema.clone(),
             )))
-            .map(|(batch_fut, args)| Self::wrap_with_filter(batch_fut, args.0, args.1));
+            .map(|(batch_fut, args)| Self::wrap_with_filter(batch_fut, args.0, args.1))
+            .stream_in_current_span();
 
         let result: Pin<Box<dyn Stream<Item = Result<ReadBatchFut>> + Send>> =
             if let Some(limit) = fragment_soft_limit {
@@ -1162,6 +1165,7 @@ impl FilteredReadStream {
                     // Drop any fields loaded purely for the purpose of applying the filter
                     Ok(batch.project_by_schema(output_schema.as_ref())?)
                 })
+                .in_current_span()
                 .boxed())
         } else {
             Ok(batch_fut)
@@ -1189,9 +1193,11 @@ impl FilteredReadStream {
                                 rows_read.fetch_add(batch_rows, Ordering::Relaxed);
                             })
                         })
+                        .in_current_span()
                         .boxed()
                 })
             })
+            .stream_in_current_span()
     }
 
     fn apply_hard_range<S>(stream: S, range: Range<u64>) -> impl Stream<Item = Result<RecordBatch>>

@@ -11,10 +11,10 @@ use std::{collections::VecDeque, ops::Range, sync::Arc};
 use arrow_array::{Array, UInt64Array, cast::AsArray, make_array};
 use bytes::Bytes;
 use futures::{FutureExt, future::BoxFuture};
-use tracing::Instrument;
 
 use lance_core::{
     Error, Result, cache::DeepSizeOf, datatypes::BLOB_DESC_TYPE, error::LanceOptionExt,
+    utils::tracing::FutureTracingExt,
 };
 
 use crate::{
@@ -61,8 +61,7 @@ impl BlobDescriptionPageScheduler {
                     as Box<dyn StructuralPageDecoder>,
             )
         }
-        .in_current_span()
-        .boxed()
+        .boxed_in_current_span()
     }
 }
 
@@ -268,8 +267,7 @@ impl BlobPageScheduler {
             Ok(Box::new(BlobPageDecoder::new(loaded_blobs, def_meaning))
                 as Box<dyn StructuralPageDecoder>)
         }
-        .in_current_span()
-        .boxed();
+        .boxed_in_current_span();
         Ok(PageLoadTask {
             decoder_fut,
             num_rows,

@@ -12,6 +12,10 @@ ROOT = Path(__file__).resolve().parent.parent
 
 HOTSPOT_FILES = [
     'rust/lance-encoding/src/decoder.rs',
+    'rust/lance-encoding/src/encodings/logical/primitive.rs',
+    'rust/lance-encoding/src/encodings/logical/primitive/blob.rs',
+    'rust/lance-io/src/object_reader.rs',
+    'rust/lance-io/src/scheduler.rs',
     'rust/lance-table/src/utils/stream.rs',
     'rust/lance/src/utils/future.rs',
     'rust/lance/src/dataset/fragment.rs',
@@ -35,9 +39,9 @@ RULES = [
         suggestion='use spawn_in_current_span(...) or spawn_in_span(...)',
     ),
     Rule(
-        name='manual boxed future span capture',
-        pattern=re.compile(r'\.in_current_span\(\)\s*\.boxed\('),
-        suggestion='use boxed_in_current_span(...) or ReadBatchTask::from_future(...)',
+        name='direct future span capture',
+        pattern=re.compile(r'\.in_current_span\(\)'),
+        suggestion='use future_in_current_span(...), boxed_in_current_span(...), or spawn_in_current_span(...)',
     ),
     Rule(
         name='manual boxed stream span capture',

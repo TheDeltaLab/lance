@@ -9,6 +9,10 @@ on:
       - ci/check_tracing_context.py
       - .github/workflows/tracing-context-check.yml
       - rust/lance-encoding/src/decoder.rs
+      - rust/lance-encoding/src/encodings/logical/primitive.rs
+      - rust/lance-encoding/src/encodings/logical/primitive/blob.rs
+      - rust/lance-io/src/object_reader.rs
+      - rust/lance-io/src/scheduler.rs
       - rust/lance-table/src/utils/stream.rs
       - rust/lance/src/utils/future.rs
       - rust/lance/src/dataset/fragment.rs
@@ -25,6 +29,10 @@ on:
       - ci/check_tracing_context.py
       - .github/workflows/tracing-context-check.yml
       - rust/lance-encoding/src/decoder.rs
+      - rust/lance-encoding/src/encodings/logical/primitive.rs
+      - rust/lance-encoding/src/encodings/logical/primitive/blob.rs
+      - rust/lance-io/src/object_reader.rs
+      - rust/lance-io/src/scheduler.rs
       - rust/lance-table/src/utils/stream.rs
       - rust/lance/src/utils/future.rs
       - rust/lance/src/dataset/fragment.rs

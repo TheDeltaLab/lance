@@ -17,10 +17,10 @@ use futures::{
     future::{BoxFuture, Shared},
     stream::{self, StreamExt},
 };
-use lance_core::{Error, Result, error::CloneableError};
+use lance_core::{Error, Result, error::CloneableError, utils::tracing::FutureTracingExt};
 use object_store::{GetOptions, GetResult, ObjectStore, Result as OSResult, path::Path};
 use tokio::sync::OnceCell;
-use tracing::{Instrument, instrument};
+use tracing::instrument;
 
 use crate::{
     object_store::DEFAULT_CLOUD_IO_PARALLELISM,
@@ -314,8 +314,7 @@ impl SmallReader {
                     .await
                     .map_err(|err| CloneableError(Error::from(err)))
             }
-            .in_current_span()
-            .boxed()
+            .boxed_in_current_span()
             .shared(),
         );
         Self {

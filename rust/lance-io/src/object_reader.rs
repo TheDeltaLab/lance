@@ -20,7 +20,7 @@ use futures::{
 use lance_core::{Error, Result, error::CloneableError};
 use object_store::{GetOptions, GetResult, ObjectStore, Result as OSResult, path::Path};
 use tokio::sync::OnceCell;
-use tracing::instrument;
+use tracing::{Instrument, instrument};
 
 use crate::{
     object_store::DEFAULT_CLOUD_IO_PARALLELISM,
@@ -305,7 +305,7 @@ impl SmallReader {
     ) -> Self {
         let path_ref = path.clone();
         let state = SmallReaderState::Loading(
-            Box::pin(async move {
+            async move {
                 let object_reader =
                     CloudObjectReader::new(store, path_ref, 0, None, download_retry_count)
                         .map_err(CloneableError)?;
@@ -313,7 +313,8 @@ impl SmallReader {
                     .get_all()
                     .await
                     .map_err(|err| CloneableError(Error::from(err)))
-            })
+            }
+            .in_current_span()
             .boxed()
             .shared(),
         );

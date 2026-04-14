@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::Notify;
+use tracing::Instrument;
 
 use lance_core::utils::parse::str_is_truthy;
 use lance_core::{Error, Result};
@@ -402,7 +403,7 @@ async fn run_io_loop(tasks: Arc<IoQueue>) {
         let next_task = tasks.pop().await;
         match next_task {
             Some(task) => {
-                tokio::spawn(task.run());
+                tokio::spawn(task.run().in_current_span());
             }
             None => {
                 // The sender has been dropped, we are done
@@ -573,7 +574,7 @@ impl ScanScheduler {
             // Best we can do here is fire and forget.  If the I/O loop is still running when the scheduler is
             // dropped we can't wait for it to finish or we'd block a tokio thread.  We could spawn a blocking task
             // to wait for it to finish but that doesn't seem helpful.
-            tokio::task::spawn(async move { run_io_loop(io_queue_clone).await });
+            tokio::task::spawn(async move { run_io_loop(io_queue_clone).await }.in_current_span());
             IoQueueType::Standard(io_queue)
         };
         Arc::new(Self {

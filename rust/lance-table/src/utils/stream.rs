@@ -14,10 +14,10 @@ use lance_arrow::RecordBatchExt;
 use lance_core::{
     ROW_ADDR, ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION_FIELD, ROW_ID, ROW_ID_FIELD,
     ROW_LAST_UPDATED_AT_VERSION_FIELD, Result,
-    utils::{address::RowAddress, deletion::DeletionVector},
+    utils::{address::RowAddress, deletion::DeletionVector, tracing::StreamTracingExt},
 };
 use lance_io::ReadBatchParams;
-use tracing::instrument;
+use tracing::{Instrument, instrument};
 
 use crate::rowids::RowIdSequence;
 
@@ -49,6 +49,7 @@ impl MergeStream {
             }
             Ok(batch)
         }
+        .in_current_span()
         .boxed();
         let num_rows = self.next_num_rows;
         self.next_num_rows = 0;
@@ -110,6 +111,7 @@ pub fn merge_streams(streams: Vec<ReadBatchTaskStream>) -> ReadBatchTaskStream {
         next_num_rows: 0,
         index: 0,
     }
+    .stream_in_current_span()
     .boxed()
 }
 
@@ -410,8 +412,10 @@ pub fn wrap_with_row_id_and_delete(
                 .map(move |batch| {
                     apply_row_id_and_deletes(batch?, this_offset, fragment_id, config.as_ref())
                 })
+                .in_current_span()
                 .boxed()
         })
+        .stream_in_current_span()
         .boxed()
 }
 

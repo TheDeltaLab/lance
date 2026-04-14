@@ -25,6 +25,7 @@ use lance_arrow::{RecordBatchExt, SchemaExt};
 use lance_core::datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions};
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
+use lance_core::utils::tracing::StreamTracingExt;
 use lance_core::{Error, Result, cache::CacheKey, datatypes::Schema};
 use lance_core::{
     ROW_ADDR, ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION_FIELD, ROW_ID, ROW_ID_FIELD,
@@ -48,6 +49,7 @@ use lance_table::utils::stream::{
     ReadBatchFutStream, ReadBatchTask, ReadBatchTaskStream, RowIdAndDeletesConfig,
     wrap_with_row_id_and_delete,
 };
+use tracing::Instrument;
 
 use self::write::FragmentCreateBuilder;
 
@@ -345,9 +347,10 @@ mod v2_adapter {
                     FilterExpression::no_filter(),
                 )?
                 .map(|v2_task| ReadBatchTask {
-                    task: v2_task.task.map_err(Error::from).boxed(),
+                    task: v2_task.task.map_err(Error::from).in_current_span().boxed(),
                     num_rows: v2_task.num_rows,
                 })
+                .stream_in_current_span()
                 .boxed())
         }
 
@@ -371,9 +374,10 @@ mod v2_adapter {
                     FilterExpression::no_filter(),
                 )?
                 .map(|v2_task| ReadBatchTask {
-                    task: v2_task.task.map_err(Error::from).boxed(),
+                    task: v2_task.task.map_err(Error::from).in_current_span().boxed(),
                     num_rows: v2_task.num_rows,
                 })
+                .stream_in_current_span()
                 .boxed())
         }
 
@@ -396,9 +400,10 @@ mod v2_adapter {
                     FilterExpression::no_filter(),
                 )?
                 .map(|v2_task| ReadBatchTask {
-                    task: v2_task.task.map_err(Error::from).boxed(),
+                    task: v2_task.task.map_err(Error::from).in_current_span().boxed(),
                     num_rows: v2_task.num_rows,
                 })
+                .stream_in_current_span()
                 .boxed())
         }
 
@@ -435,9 +440,10 @@ mod v2_adapter {
                     FilterExpression::no_filter(),
                 )?
                 .map(|v2_task| ReadBatchTask {
-                    task: v2_task.task.map_err(Error::from).boxed(),
+                    task: v2_task.task.map_err(Error::from).in_current_span().boxed(),
                     num_rows: v2_task.num_rows,
                 })
+                .stream_in_current_span()
                 .boxed())
         }
 

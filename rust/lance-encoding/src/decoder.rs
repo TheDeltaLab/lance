@@ -229,13 +229,14 @@ use lance_core::cache::LanceCache;
 use lance_core::datatypes::{BLOB_DESC_LANCE_FIELD, Field, Schema};
 use lance_core::utils::futures::{FinallyStreamExt, StreamOnDropExt};
 use lance_core::utils::parse::parse_env_as_bool;
+use lance_core::utils::tracing::StreamTracingExt;
 use log::{debug, trace, warn};
 use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::{self, unbounded_channel};
 
 use lance_core::error::LanceOptionExt;
 use lance_core::{ArrowResult, Error, Result};
-use tracing::{Instrument, instrument};
+use tracing::{Instrument, Span, instrument};
 
 use crate::compression::{DecompressionStrategy, DefaultDecompressionStrategy};
 use crate::data::DataBlock;
@@ -1473,13 +1474,12 @@ impl BatchDecodeStream {
                     // Real decode work happens inside into_batch, which can block the current
                     // thread for a long time. By spawning it as a new task, we allow Tokio's
                     // worker threads to keep making progress.
-                    let (batch, _data_size) =
-                        tokio::spawn(
-                            async move { next_task.into_batch(emitted_batch_size_warning) }
-                                .in_current_span(),
-                        )
-                        .await
-                        .map_err(|err| Error::wrapped(err.into()))??;
+                    let (batch, _data_size) = tokio::spawn(
+                        async move { next_task.into_batch(emitted_batch_size_warning) }
+                            .in_current_span(),
+                    )
+                    .await
+                    .map_err(|err| Error::wrapped(err.into()))??;
                     Ok(batch)
                 };
                 (task, num_rows)
@@ -1488,13 +1488,13 @@ impl BatchDecodeStream {
                 // This should be true since batch size is u32
                 debug_assert!(num_rows <= u32::MAX as u64);
                 let next_task = ReadBatchTask {
-                    task: task.boxed(),
+                    task: task.in_current_span().boxed(),
                     num_rows: num_rows as u32,
                 };
                 (next_task, slf)
             })
         });
-        stream.boxed()
+        stream.stream_in_current_span().boxed()
     }
 }
 
@@ -1548,6 +1548,7 @@ struct BatchDecodeIterator<T: RootDecoderType> {
     rows_scheduled: u64,
     rows_drained: u64,
     emitted_batch_size_warning: Arc<Once>,
+    span: Span,
     // Note: this is not the runtime on which I/O happens.
     // That's always in the scheduler.  This is just a runtime we use to
     // sleep the current thread if I/O is unready
@@ -1575,6 +1576,7 @@ impl<T: RootDecoderType> BatchDecodeIterator<T> {
                 .build()
                 .unwrap(),
             emitted_batch_size_warning: Arc::new(Once::new()),
+            span: Span::current(),
             schema,
         }
     }
@@ -1676,6 +1678,8 @@ impl<T: RootDecoderType> Iterator for BatchDecodeIterator<T> {
     type Item = ArrowResult<RecordBatch>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        let span = self.span.clone();
+        let _guard = span.enter();
         self.next_batch_task()
             .transpose()
             .map(|r| r.map_err(ArrowError::from))
@@ -1914,13 +1918,13 @@ impl StructuralBatchDecodeStream {
                 // This should be true since batch size is u32
                 debug_assert!(num_rows <= u32::MAX as u64);
                 let next_task = ReadBatchTask {
-                    task: task.boxed(),
+                    task: task.in_current_span().boxed(),
                     num_rows: num_rows as u32,
                 };
                 (next_task, slf)
             })
         });
-        stream.boxed()
+        stream.stream_in_current_span().boxed()
     }
 }
 

@@ -37,6 +37,7 @@ use lance_core::{
     utils::bit::pad_bytes,
 };
 use log::trace;
+use tracing::Instrument;
 
 use crate::{
     compression::{
@@ -1940,6 +1941,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
                 has_large_chunk,
             }) as Box<dyn StructuralPageDecoder>)
         }
+        .in_current_span()
         .boxed();
         let page_load_task = PageLoadTask {
             decoder_fut: res,
@@ -2176,6 +2178,7 @@ impl FullZipScheduler {
             let data = read_source.fetch(&byte_ranges, priority).await?;
             Self::create_decoder(details, data, num_rows, bits_per_offset)
         }
+        .in_current_span()
         .boxed();
         PageLoadTask {
             decoder_fut: load_task,
@@ -2318,6 +2321,7 @@ impl FullZipScheduler {
                 let data = source.fetch(&read_ranges, priority).await?;
                 Self::create_decoder(details, data, num_rows, bits_per_offset)
             }
+            .in_current_span()
             .boxed();
             let page_load_task = PageLoadTask {
                 decoder_fut: load_task,
@@ -2364,6 +2368,7 @@ impl FullZipScheduler {
             let data = source.fetch(&byte_ranges, priority).await?;
             Self::create_decoder(details, data, num_rows, bits_per_offset)
         }
+        .in_current_span()
         .boxed();
         let page_load_task = PageLoadTask {
             decoder_fut: load_task,
@@ -3196,6 +3201,7 @@ impl StructuralSchedulingJob for StructuralPrimitiveFieldSchedulingJob<'_> {
                         path: cur_path,
                     })
                 }
+                .in_current_span()
                 .boxed();
                 Ok(ScheduledScanLine {
                     decoders: vec![MessageType::UnloadedPage(UnloadedPageShard(unloaded_page))],

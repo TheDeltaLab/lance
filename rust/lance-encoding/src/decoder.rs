@@ -235,7 +235,7 @@ use tokio::sync::mpsc::{self, unbounded_channel};
 
 use lance_core::error::LanceOptionExt;
 use lance_core::{ArrowResult, Error, Result};
-use tracing::instrument;
+use tracing::{Instrument, instrument};
 
 use crate::compression::{DecompressionStrategy, DefaultDecompressionStrategy};
 use crate::data::DataBlock;
@@ -1475,7 +1475,8 @@ impl BatchDecodeStream {
                     // worker threads to keep making progress.
                     let (batch, _data_size) =
                         tokio::spawn(
-                            async move { next_task.into_batch(emitted_batch_size_warning) },
+                            async move { next_task.into_batch(emitted_batch_size_warning) }
+                                .in_current_span(),
                         )
                         .await
                         .map_err(|err| Error::wrapped(err.into()))??;
@@ -1881,7 +1882,8 @@ impl StructuralBatchDecodeStream {
                     let next_task = next_task?;
                     let (batch, data_size) = if spawn_batch_decode_tasks {
                         tokio::spawn(
-                            async move { next_task.into_batch(emitted_batch_size_warning) },
+                            async move { next_task.into_batch(emitted_batch_size_warning) }
+                                .in_current_span(),
                         )
                         .await
                         .map_err(|err| Error::wrapped(err.into()))??
@@ -2120,37 +2122,40 @@ fn create_scheduler_decoder(
         config.batch_size_bytes,
     )?;
 
-    let scheduler_handle = tokio::task::spawn(async move {
-        let mut decode_scheduler = match DecodeBatchScheduler::try_new(
-            target_schema.as_ref(),
-            &column_indices,
-            &column_infos,
-            &vec![],
-            num_rows,
-            config.decoder_plugins,
-            config.io.clone(),
-            config.cache,
-            &filter,
-            &config.decoder_config,
-        )
-        .await
-        {
-            Ok(scheduler) => scheduler,
-            Err(e) => {
-                let _ = tx.send(Err(e));
-                return;
-            }
-        };
+    let scheduler_handle = tokio::task::spawn(
+        async move {
+            let mut decode_scheduler = match DecodeBatchScheduler::try_new(
+                target_schema.as_ref(),
+                &column_indices,
+                &column_infos,
+                &vec![],
+                num_rows,
+                config.decoder_plugins,
+                config.io.clone(),
+                config.cache,
+                &filter,
+                &config.decoder_config,
+            )
+            .await
+            {
+                Ok(scheduler) => scheduler,
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                    return;
+                }
+            };
 
-        match requested_rows {
-            RequestedRows::Ranges(ranges) => {
-                decode_scheduler.schedule_ranges(&ranges, &filter, tx, config.io)
-            }
-            RequestedRows::Indices(indices) => {
-                decode_scheduler.schedule_take(&indices, &filter, tx, config.io)
+            match requested_rows {
+                RequestedRows::Ranges(ranges) => {
+                    decode_scheduler.schedule_ranges(&ranges, &filter, tx, config.io)
+                }
+                RequestedRows::Indices(indices) => {
+                    decode_scheduler.schedule_take(&indices, &filter, tx, config.io)
+                }
             }
         }
-    });
+        .in_current_span(),
+    );
 
     Ok(check_scheduler_on_drop(decode_stream, scheduler_handle))
 }

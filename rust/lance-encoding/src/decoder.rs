@@ -230,9 +230,7 @@ use lance_core::datatypes::{BLOB_DESC_LANCE_FIELD, Field, Schema};
 use lance_core::utils::futures::{FinallyStreamExt, StreamOnDropExt};
 use lance_core::utils::parse::parse_env_as_bool;
 use lance_core::utils::tokio::{spawn_in_current_span, spawn_in_span};
-use lance_core::utils::tracing::{
-    FutureTracingExt, StreamTracingExt,
-};
+use lance_core::utils::tracing::{FutureTracingExt, StreamTracingExt};
 use log::{debug, trace, warn};
 use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::{self, unbounded_channel};

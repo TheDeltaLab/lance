@@ -46,9 +46,7 @@ use lance_core::{
     Error, Result,
     utils::{
         futures::FinallyStreamExt,
-        tracing::{
-            EXECUTION_PLAN_RUN, StreamTracingExt, TRACE_EXECUTION,
-        },
+        tracing::{EXECUTION_PLAN_RUN, StreamTracingExt, TRACE_EXECUTION},
     },
 };
 use log::{debug, info, warn};

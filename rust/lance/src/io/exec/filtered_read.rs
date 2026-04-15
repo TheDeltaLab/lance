@@ -35,9 +35,7 @@ use lance_core::utils::mask::{
     RowAddrMask, RowAddrSelection, RowAddrTreeMap, bitmap_to_ranges, ranges_to_bitmap,
 };
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_in_current_span};
-use lance_core::utils::tracing::{
-    FutureTracingExt, StreamTracingExt,
-};
+use lance_core::utils::tracing::{FutureTracingExt, StreamTracingExt};
 use lance_core::{Error, Result, datatypes::Projection};
 use lance_datafusion::planner::Planner;
 use lance_datafusion::utils::{

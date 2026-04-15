@@ -1,7 +1,26 @@
 # Tracing Context Propagation
 
-Rust query execution in Lance crosses many async boundaries: boxed futures, boxed streams, and detached Tokio tasks.
-If those boundaries do not preserve the current span, Tempo will show `lance-rust` work as orphan root traces instead of attaching it to the original request trace.
+Rust query execution in Lance crosses many async boundaries: boxed futures, boxed streams, `tokio::spawn`, and `spawn_blocking` tasks.
+If those boundaries do not preserve the current span, distributed tracing backends (e.g. Tempo) will show `lance-rust` work as orphan root traces instead of attaching it to the original request trace.
+
+## Architecture
+
+### TracedExec
+
+`TracedExec` (in `lance-datafusion/src/exec.rs`) is a DataFusion `ExecutionPlan` wrapper that captures the caller's tracing span at construction time and enters it during `execute()` and stream polls.
+
+Because DataFusion plan nodes are **lazy** (they build inner streams on first poll, not at plan creation), downstream span-aware calls like `boxed_stream_in_current_span()` would observe `Span::current()` as `<none>` without this wrapper.
+
+`execute_plan()` applies `TracedExec` automatically:
+
+```rust
+let traced_plan = Arc::new(TracedExec::new(plan.clone(), Span::current()));
+let stream = traced_plan.execute(0, task_ctx)?;
+```
+
+### DataFusion JoinSet Tracing
+
+`ensure_datafusion_task_tracing()` registers a `LanceJoinSetTracer` with DataFusion so that tasks spawned internally by DataFusion (e.g. in joins, aggregations) carry the current span.
 
 ## Rule of Thumb
 
@@ -12,24 +31,59 @@ If a helper does not already exist for the boundary you are working on, add or e
 
 Use the shared helpers from `lance_core`:
 
-- `spawn_in_current_span(...)` / `spawn_in_span(...)` for `tokio::spawn(...)`
-- `future_in_current_span()` / `future_in_span(...)` for non-boxed futures
-- `boxed_in_current_span()` / `boxed_in_span(...)` for boxed futures
-- `stream_in_current_span()` / `stream_in_span(...)` for non-boxed streams
-- `boxed_stream_in_current_span()` / `boxed_stream_in_span(...)` for boxed streams
+| Boundary | Helper |
+|---|---|
+| `tokio::spawn(...)` | `spawn_in_current_span(...)` / `spawn_in_span(...)` |
+| Non-boxed future | `.future_in_current_span()` / `.future_in_span(...)` |
+| Boxed future | `.boxed_in_current_span()` / `.boxed_in_span(...)` |
+| Non-boxed stream | `.stream_in_current_span()` / `.stream_in_span(...)` |
+| Boxed stream | `.boxed_stream_in_current_span()` / `.boxed_stream_in_span(...)` |
 
-For decoder-style batch task wrappers, prefer tracing-aware constructors such as `ReadBatchTask::from_future(...)` instead of manually boxing and instrumenting the future at each call site.
+These are provided by the `FutureTracingExt` and `StreamTracingExt` traits in `lance_core::utils::tracing`.
 
 ## Common Rewrites
+
+### Capture-then-clone in stream/closure chains
+
+`Span::current()` returns the span that is active **at the moment of the call**.
+Inside a stream `.map()` closure, the "current" span depends on whoever is **polling** the stream, which may be a completely different context from the code that created the stream.
+
+The correct pattern is to capture the span **once** before the stream chain, then clone it into each closure iteration:
+
+```rust
+let stream_span = Span::current();            // capture at creation time
+stream
+    .map(move |task| {
+        let stream_span = stream_span.clone(); // clone into each iteration
+        task.map(move |batch| transform(batch?))
+            .boxed_in_span(stream_span)        // use the captured span
+    })
+    .boxed_stream_in_current_span()
+```
+
+**Wrong** — using `_in_current_span()` inside the closure:
+
+```rust
+// BUG: Span::current() here is the *poller's* span, not the creator's
+stream
+    .map(move |task| {
+        task.map(move |batch| transform(batch?))
+            .boxed_in_current_span()
+    })
+    .boxed_stream_in_current_span()
+```
+
+The same principle applies to any `move` closure that will execute later (e.g. callbacks, `then`, `and_then`).
+As a rule: if the closure crosses an async boundary, capture the span outside and pass it in.
 
 ### Spawning work
 
 Instead of:
 
 ```rust
- tokio::spawn(async move {
-     do_work().await
- }.in_current_span())
+tokio::spawn(async move {
+    do_work().await
+}.in_current_span())
 ```
 
 Use:
@@ -75,13 +129,32 @@ Use:
 stream.boxed_stream_in_current_span()
 ```
 
-## CI Policy
+## Regression Tests
 
-`ci/check_tracing_context.py` enforces these rules for the current tracing-sensitive hotspots.
-When a new execution path becomes trace-sensitive, extend the hotspot file list in that script and in `.github/workflows/tracing-context-check.yml` as part of the same change.
+The integration test suite includes orphan-span detection tests in `rust/lance/tests/query/tracing.rs`.
+These tests use a `SpanTreeRecorder` tracing layer to record all spans and assert that every span is reachable from the test root (no orphans).
 
-## How to Validate
+Covered query paths:
 
-For tracing regressions, validate with a real request and inspect the full Tempo time window around that request.
+- Multi-fragment scan
+- FTS with filter
+- Vector search (IVF-PQ index)
+- Hybrid FTS + vector reranker (`fts_rerank`)
+- All of the above on local filesystem (exercises `spawn_blocking` in `local.rs`)
+
+Run with:
+
+```bash
+cargo test -p lance --features slow_tests --test integration_tests query::tracing::
+```
+
+## Code Review Policy
+
+Tracing context rules are enforced through code review (see `.github/copilot-instructions.md`).
+When reviewing PRs that touch async execution paths, check that new code follows the patterns described above.
+
+## How to Validate End-to-End
+
+For tracing regressions beyond the in-process tests, validate with a real request and inspect the full Tempo time window around that request.
 Do not only search for a single span name.
 Success means the window contains one request root trace and `lance-rust` spans remain underneath it instead of appearing as a separate root trace.

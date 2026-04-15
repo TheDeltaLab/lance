@@ -119,8 +119,12 @@ pub fn spawn_cpu<
     // Propagate the current span into the task
     let span = Span::current();
     global_cpu_runtime().spawn_blocking(move || {
-        let _span_guard = span.enter();
-        let result = func();
+        let result = {
+            let _span_guard = span.enter();
+            func()
+        };
+        // Exit the span BEFORE sending the result so the caller never
+        // observes the span as "still active" after receiving the value.
         let _ = send.send(result);
     });
     recv.map(|res| res.unwrap())

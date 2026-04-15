@@ -1119,9 +1119,8 @@ mod tests {
     #[test]
     fn test_traced_exec_display_and_debug() {
         let schema = Arc::new(ArrowSchema::empty());
-        let input: Arc<dyn ExecutionPlan> = Arc::new(OneShotExec::from_batch(
-            RecordBatch::new_empty(schema),
-        ));
+        let input: Arc<dyn ExecutionPlan> =
+            Arc::new(OneShotExec::from_batch(RecordBatch::new_empty(schema)));
         let traced = TracedExec::new(input, Span::current());
 
         // Debug
@@ -1150,9 +1149,8 @@ mod tests {
         let input1: Arc<dyn ExecutionPlan> = Arc::new(OneShotExec::from_batch(
             RecordBatch::new_empty(schema.clone()),
         ));
-        let input2: Arc<dyn ExecutionPlan> = Arc::new(OneShotExec::from_batch(
-            RecordBatch::new_empty(schema),
-        ));
+        let input2: Arc<dyn ExecutionPlan> =
+            Arc::new(OneShotExec::from_batch(RecordBatch::new_empty(schema)));
 
         let traced = Arc::new(TracedExec::new(input1, Span::current()));
         let new_traced = traced.with_new_children(vec![input2]).unwrap();

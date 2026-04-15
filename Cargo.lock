@@ -4795,6 +4795,7 @@ dependencies = [
  "chrono",
  "datafusion",
  "datafusion-common",
+ "datafusion-common-runtime",
  "datafusion-functions",
  "datafusion-physical-expr",
  "datafusion-substrait",
@@ -5095,6 +5096,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-mock",
+ "tracing-subscriber",
  "url",
 ]
 

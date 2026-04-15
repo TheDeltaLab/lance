@@ -11,7 +11,6 @@ use arrow::array::AsArray;
 use arrow::datatypes::UInt32Type;
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
-use datafusion::common::runtime::SpawnedTask;
 use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -35,8 +34,10 @@ use lance_core::utils::futures::FinallyStreamExt;
 use lance_core::utils::mask::{
     RowAddrMask, RowAddrSelection, RowAddrTreeMap, bitmap_to_ranges, ranges_to_bitmap,
 };
-use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::utils::tracing::{FutureTracingExt, StreamTracingExt};
+use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_in_current_span};
+use lance_core::utils::tracing::{
+    FutureTracingExt, StreamTracingExt,
+};
 use lance_core::{Error, Result, datatypes::Projection};
 use lance_datafusion::planner::Planner;
 use lance_datafusion::utils::{
@@ -440,15 +441,14 @@ impl FilteredReadStream {
                 move |scoped_fragment| {
                     let metrics = global_metrics_clone.clone();
                     let limit = scan_range_after_filter.as_ref().map(|r| r.end);
-                    SpawnedTask::spawn(
-                        Self::read_fragment(scoped_fragment, metrics, limit)
-                            .future_in_current_span(),
-                    )
-                    .map(|thread_result| thread_result.unwrap())
+                    spawn_in_current_span(Self::read_fragment(scoped_fragment, metrics, limit))
+                        .map(|thread_result| thread_result.unwrap())
                 }
             })
             .buffered(fragment_readahead);
-        let task_stream = fragment_streams.try_flatten().boxed();
+        let task_stream = fragment_streams
+            .try_flatten()
+            .boxed_stream_in_current_span();
 
         Ok(Self {
             output_schema,
@@ -977,10 +977,11 @@ impl FilteredReadStream {
                         });
 
                 let batch_stream = if let Some(ref range) = self.scan_range_after_filter {
-                    Self::apply_hard_range(base_batch_stream, range.clone()).boxed()
+                    Self::apply_hard_range(base_batch_stream, range.clone())
+                        .boxed_stream_in_current_span()
                 } else {
                     // Need to box here otherwise the if/else returns incompatible types
-                    base_batch_stream.boxed()
+                    base_batch_stream.boxed_stream_in_current_span()
                 };
 
                 let batch_stream = batch_stream
@@ -994,7 +995,7 @@ impl FilteredReadStream {
                         partition_metrics.baseline_metrics.done();
                     })
                     .map_err(|e: lance_core::Error| DataFusionError::External(e.into()))
-                    .boxed();
+                    .boxed_stream_in_current_span();
 
                 Box::pin(RecordBatchStreamAdapter::new(output_schema, batch_stream))
             }
@@ -1046,7 +1047,8 @@ impl FilteredReadStream {
                         Some(batch)
                     }))
                 })
-                .map_err(|e: lance_core::Error| DataFusionError::External(e.into()));
+                .map_err(|e: lance_core::Error| DataFusionError::External(e.into()))
+                .boxed_stream_in_current_span();
                 Box::pin(RecordBatchStreamAdapter::new(output_schema, batch_stream))
             }
         }
@@ -1738,7 +1740,8 @@ impl FilteredReadExec {
                 DataFusionResult::Ok(first_stream)
             }
         })
-        .try_flatten();
+        .try_flatten()
+        .boxed_stream_in_current_span();
 
         Box::pin(RecordBatchStreamAdapter::new(self.schema(), stream))
     }

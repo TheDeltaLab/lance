@@ -15,8 +15,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::Notify;
 
-use lance_core::utils::{parse::str_is_truthy, tokio::spawn_in_current_span};
+use lance_core::utils::{
+    parse::str_is_truthy,
+    tokio::{spawn_in_current_span, spawn_in_span},
+};
 use lance_core::{Error, Result};
+use tracing::Span;
 
 use crate::object_store::ObjectStore;
 use crate::traits::Reader;
@@ -329,6 +333,7 @@ struct IoTask {
     to_read: Range<u64>,
     when_done: Box<dyn FnOnce(Result<Bytes>) + Send>,
     priority: u128,
+    span: Span,
 }
 
 impl Eq for IoTask {}
@@ -402,7 +407,10 @@ async fn run_io_loop(tasks: Arc<IoQueue>) {
         let next_task = tasks.pop().await;
         match next_task {
             Some(task) => {
-                spawn_in_current_span(task.run());
+                // The I/O loop itself may outlive any one query span, so each task needs to
+                // carry the span that was current when it was submitted.
+                let span = task.span.clone();
+                spawn_in_span(task.run(), span);
             }
             None => {
                 // The sender has been dropped, we are done
@@ -653,6 +661,7 @@ impl ScanScheduler {
             priority,
             request.len(),
         ))));
+        let request_span = Span::current();
 
         for (task_idx, iop) in request.into_iter().enumerate() {
             let dest = dest.clone();
@@ -662,6 +671,7 @@ impl ScanScheduler {
                 reader: reader.clone(),
                 to_read: iop,
                 priority,
+                span: request_span.clone(),
                 when_done: Box::new(move |data| {
                     io_queue_clone.on_iop_complete();
                     let mut dest = dest.lock().unwrap();
@@ -957,6 +967,8 @@ mod tests {
 
     use object_store::{GetRange, ObjectStore as OSObjectStore, memory::InMemory};
     use tokio::{runtime::Handle, time::timeout};
+    use tracing::Instrument;
+    use tracing_subscriber::registry;
     use url::Url;
 
     use crate::{
@@ -1184,6 +1196,64 @@ mod tests {
         // Finally, the low priority request
         semaphore_copy.add_permits(1);
         assert!(second_fut.await.unwrap().unwrap().len() == 20);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_standard_scheduler_uses_submit_span_for_io_tasks() {
+        let some_path = Path::parse("foo").unwrap();
+        let base_store = Arc::new(InMemory::new());
+        base_store
+            .put(&some_path, vec![0; 1000].into())
+            .await
+            .unwrap();
+
+        let seen_spans = Arc::new(Mutex::new(Vec::new()));
+        let mut obj_store = MockObjectStore::default();
+        let seen_spans_copy = seen_spans.clone();
+        obj_store
+            .expect_get_opts()
+            .returning(move |location, options| {
+                let current_span = tracing::Span::current()
+                    .metadata()
+                    .map(|metadata| metadata.name().to_string())
+                    .unwrap_or_else(|| "<none>".to_string());
+                seen_spans_copy.lock().unwrap().push(current_span);
+
+                let base_store = base_store.clone();
+                let location = location.clone();
+                async move { base_store.get_opts(&location, options).await }.boxed()
+            });
+        let obj_store = Arc::new(ObjectStore::new(
+            Arc::new(obj_store),
+            Url::parse("mem://").unwrap(),
+            Some(500),
+            None,
+            false,
+            false,
+            1,
+            DEFAULT_DOWNLOAD_RETRY_COUNT,
+            None,
+        ));
+
+        let _guard = tracing::subscriber::set_default(registry());
+        let scheduler_root = tracing::info_span!("scheduler_root");
+        let scheduler = scheduler_root
+            .in_scope(|| ScanScheduler::new(obj_store, SchedulerConfig::default_for_testing()));
+        let file_scheduler = scheduler
+            .open_file(&some_path, &CachedFileSize::new(1000))
+            .await
+            .unwrap();
+
+        async move {
+            file_scheduler.submit_single(0..10, 0).await.unwrap();
+        }
+        .instrument(tracing::info_span!("request_root"))
+        .await;
+
+        assert_eq!(
+            *seen_spans.lock().unwrap(),
+            vec!["request_root".to_string()]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

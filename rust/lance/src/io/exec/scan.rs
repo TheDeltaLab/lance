@@ -313,7 +313,7 @@ impl LanceStream {
                                         .boxed_in_current_span(),
                                 )
                             })
-                            .boxed();
+                            .boxed_stream_in_current_span();
                     Result::Ok(batch_stream)
                 })
                 .map(|res_res| res_res.unwrap())
@@ -691,12 +691,13 @@ impl ExecutionPlan for LanceScanExec {
         let config = self.config.clone();
         let metrics = self.metrics.clone();
 
-        let lance_fut_stream = stream::once(async move {
+        let lance_stream = stream::once(async move {
             LanceStream::try_new(
                 dataset, fragments, range, projection, config, &metrics, partition,
             )
-        });
-        let lance_stream = lance_fut_stream.try_flatten();
+        })
+        .boxed_stream_in_current_span()
+        .try_flatten();
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
             lance_stream,

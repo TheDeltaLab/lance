@@ -32,6 +32,7 @@ use lance_core::{
     Error, Result,
     cache::LanceCache,
     datatypes::{Field, Schema},
+    utils::tracing::StreamTracingExt,
 };
 use lance_encoding::format::pb as pbenc;
 use lance_encoding::format::pb21 as pbenc21;
@@ -1181,7 +1182,7 @@ impl FileReader {
         let batch_stream = tasks_stream
             .map(|task| task.task)
             .buffered(batch_readahead as usize)
-            .boxed();
+            .boxed_stream_in_current_span();
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             arrow_schema,
             batch_stream,

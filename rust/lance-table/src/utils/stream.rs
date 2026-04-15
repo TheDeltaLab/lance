@@ -20,7 +20,7 @@ pub use lance_file::reader::{
     ReadBatchFut, ReadBatchFutStream, ReadBatchTask, ReadBatchTaskStream,
 };
 use lance_io::ReadBatchParams;
-use tracing::instrument;
+use tracing::{Span, instrument};
 
 use crate::rowids::RowIdSequence;
 
@@ -390,10 +390,12 @@ pub fn wrap_with_row_id_and_delete(
     config: RowIdAndDeletesConfig,
 ) -> ReadBatchFutStream {
     let config = Arc::new(config);
+    let stream_span = Span::current();
     let mut offset = 0;
     stream
         .map(move |batch_task| {
             let config = config.clone();
+            let stream_span = stream_span.clone();
             let this_offset = offset;
             let num_rows = batch_task.num_rows;
             offset += num_rows;
@@ -402,7 +404,7 @@ pub fn wrap_with_row_id_and_delete(
                 .map(move |batch| {
                     apply_row_id_and_deletes(batch?, this_offset, fragment_id, config.as_ref())
                 })
-                .boxed_in_current_span()
+                .boxed_in_span(stream_span)
         })
         .boxed_stream_in_current_span()
 }

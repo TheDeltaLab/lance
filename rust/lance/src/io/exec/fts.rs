@@ -20,10 +20,7 @@ use datafusion_physical_plan::metrics::{BaselineMetrics, Count};
 use futures::stream::{self};
 use futures::{FutureExt, Stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
-use lance_core::{
-    ROW_ID,
-    utils::tracing::{FutureTracingExt, StreamTracingExt},
-};
+use lance_core::{ROW_ID, utils::tracing::StreamTracingExt};
 use lance_datafusion::utils::{ExecutionPlanMetricsSetExt, MetricsExt, PARTITIONS_SEARCHED_METRIC};
 
 use super::PreFilterSource;
@@ -33,16 +30,17 @@ use crate::{Dataset, index::DatasetIndexInternalExt};
 use lance_index::IndexCriteria;
 use lance_index::metrics::MetricsCollector;
 use lance_index::scalar::inverted::builder::document_input;
-use lance_index::scalar::inverted::lance_tokenizer::{DocType, JsonTokenizer, LanceTokenizer};
+use lance_index::scalar::inverted::document_tokenizer::{DocType, JsonTokenizer, LanceTokenizer};
 use lance_index::scalar::inverted::query::{
     BoostQuery, FtsSearchParams, MatchQuery, PhraseQuery, Tokens, collect_query_tokens,
     has_query_token,
 };
-use lance_index::scalar::inverted::tokenizer::lance_tokenizer::TextTokenizer;
+use lance_index::scalar::inverted::tokenizer::document_tokenizer::TextTokenizer;
 use lance_index::scalar::inverted::{
     FTS_SCHEMA, InvertedIndex, SCORE_COL, flat_bm25_search_stream,
 };
 use lance_index::{prefilter::PreFilter, scalar::inverted::query::BooleanQuery};
+use lance_tokenizer::{SimpleTokenizer, TextAnalyzer};
 use tracing::instrument;
 
 pub struct FtsIndexMetrics {
@@ -232,99 +230,94 @@ impl ExecutionPlan for MatchQueryExec {
             "column not set for MatchQuery {}",
             query.terms
         )))?;
-        let stream = stream::once(
-            async move {
-                let _timer = metrics.baseline_metrics.elapsed_compute().timer();
-                let index_meta = ds
-                    .load_scalar_index(IndexCriteria::default().for_column(&column).supports_fts())
-                    .await?
-                    .ok_or(DataFusionError::Execution(format!(
-                        "No Inverted index found for column {}",
+        let stream = stream::once(async move {
+            let _timer = metrics.baseline_metrics.elapsed_compute().timer();
+            let index_meta = ds
+                .load_scalar_index(IndexCriteria::default().for_column(&column).supports_fts())
+                .await?
+                .ok_or(DataFusionError::Execution(format!(
+                    "No Inverted index found for column {}",
+                    column,
+                )))?;
+            let uuid = index_meta.uuid.to_string();
+            let index = ds
+                .open_generic_index(&column, &uuid, &metrics.index_metrics)
+                .await?;
+
+            let mut pre_filter = build_prefilter(
+                context.clone(),
+                partition,
+                &prefilter_source,
+                ds,
+                &[index_meta],
+            )?;
+
+            let inverted_idx = index
+                .as_any()
+                .downcast_ref::<InvertedIndex>()
+                .ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "Index for column {} is not an inverted index",
                         column,
-                    )))?;
-                let uuid = index_meta.uuid.to_string();
-                let index = ds
-                    .open_generic_index(&column, &uuid, &metrics.index_metrics)
-                    .await?;
-
-                let mut pre_filter = build_prefilter(
-                    context.clone(),
-                    partition,
-                    &prefilter_source,
-                    ds,
-                    &[index_meta],
-                )?;
-
-                let inverted_idx =
-                    index
-                        .as_any()
-                        .downcast_ref::<InvertedIndex>()
-                        .ok_or_else(|| {
-                            DataFusionError::Execution(format!(
-                                "Index for column {} is not an inverted index",
-                                column,
-                            ))
-                        })?;
-                if !inverted_idx.deleted_fragments().is_empty() {
-                    Arc::get_mut(&mut pre_filter)
-                        .expect("prefilter just created")
-                        .set_deleted_fragments(inverted_idx.deleted_fragments().clone());
-                }
-                metrics.record_parts_searched(inverted_idx.partition_count());
-
-                let is_fuzzy = matches!(query.fuzziness, Some(n) if n != 0);
-                let params = params
-                    .with_fuzziness(query.fuzziness)
-                    .with_max_expansions(query.max_expansions)
-                    .with_prefix_length(query.prefix_length);
-                let mut tokenizer =
-                    match is_fuzzy {
-                        false => inverted_idx.tokenizer(),
-                        true => {
-                            let tokenizer = tantivy::tokenizer::TextAnalyzer::from(
-                                tantivy::tokenizer::SimpleTokenizer::default(),
-                            );
-                            match inverted_idx.tokenizer().doc_type() {
-                                DocType::Text => Box::new(TextTokenizer::new(tokenizer))
-                                    as Box<dyn LanceTokenizer>,
-                                DocType::Json => Box::new(JsonTokenizer::new(tokenizer))
-                                    as Box<dyn LanceTokenizer>,
-                            }
-                        }
-                    };
-                let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
-
-                pre_filter.wait_for_ready().await?;
-                let (doc_ids, mut scores) = inverted_idx
-                    .bm25_search(
-                        Arc::new(tokens),
-                        params.into(),
-                        query.operator,
-                        pre_filter,
-                        metrics.clone(),
-                    )
-                    .boxed()
-                    .await?;
-                scores.iter_mut().for_each(|s| {
-                    *s *= query.boost;
-                });
-                metrics.baseline_metrics.record_output(doc_ids.len());
-
-                let batch = RecordBatch::try_new(
-                    FTS_SCHEMA.clone(),
-                    vec![
-                        Arc::new(UInt64Array::from(doc_ids)),
-                        Arc::new(Float32Array::from(scores)),
-                    ],
-                )?;
-                Ok::<_, DataFusionError>(batch)
+                    ))
+                })?;
+            if !inverted_idx.deleted_fragments().is_empty() {
+                Arc::get_mut(&mut pre_filter)
+                    .expect("prefilter just created")
+                    .set_deleted_fragments(inverted_idx.deleted_fragments().clone());
             }
-            .future_in_current_span(),
-        );
+            metrics.record_parts_searched(inverted_idx.partition_count());
+
+            let is_fuzzy = matches!(query.fuzziness, Some(n) if n != 0);
+            let params = params
+                .with_fuzziness(query.fuzziness)
+                .with_max_expansions(query.max_expansions)
+                .with_prefix_length(query.prefix_length);
+            let mut tokenizer = match is_fuzzy {
+                false => inverted_idx.tokenizer(),
+                true => {
+                    let tokenizer = TextAnalyzer::from(SimpleTokenizer::default());
+                    match inverted_idx.tokenizer().doc_type() {
+                        DocType::Text => {
+                            Box::new(TextTokenizer::new(tokenizer)) as Box<dyn LanceTokenizer>
+                        }
+                        DocType::Json => {
+                            Box::new(JsonTokenizer::new(tokenizer)) as Box<dyn LanceTokenizer>
+                        }
+                    }
+                }
+            };
+            let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
+
+            pre_filter.wait_for_ready().await?;
+            let (doc_ids, mut scores) = inverted_idx
+                .bm25_search(
+                    Arc::new(tokens),
+                    params.into(),
+                    query.operator,
+                    pre_filter,
+                    metrics.clone(),
+                )
+                .boxed()
+                .await?;
+            scores.iter_mut().for_each(|s| {
+                *s *= query.boost;
+            });
+            metrics.baseline_metrics.record_output(doc_ids.len());
+
+            let batch = RecordBatch::try_new(
+                FTS_SCHEMA.clone(),
+                vec![
+                    Arc::new(UInt64Array::from(doc_ids)),
+                    Arc::new(Float32Array::from(scores)),
+                ],
+            )?;
+            Ok::<_, DataFusionError>(batch)
+        });
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
-            stream.boxed_stream_in_current_span(),
+            stream.stream_in_current_span().boxed(),
         )))
     }
 
@@ -403,10 +396,7 @@ impl FlatMatchFilterExec {
         } // Else, no index, use text tokenzier
 
         Ok(Box::new(TextTokenizer::new(
-            tantivy::tokenizer::TextAnalyzer::builder(
-                tantivy::tokenizer::SimpleTokenizer::default(),
-            )
-            .build(),
+            TextAnalyzer::builder(SimpleTokenizer::default()).build(),
         )))
     }
 
@@ -882,81 +872,78 @@ impl ExecutionPlan for PhraseQueryExec {
         let ds = self.dataset.clone();
         let prefilter_source = self.prefilter_source.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
-        let stream = stream::once(
-            async move {
-                let _timer = metrics.baseline_metrics.elapsed_compute().timer();
-                let column = query
-                    .column
-                    .clone()
-                    .ok_or(DataFusionError::Execution(format!(
-                        "column not set for PhraseQuery {}",
-                        query.terms
-                    )))?;
-                let index_meta = ds
-                    .load_scalar_index(IndexCriteria::default().for_column(&column).supports_fts())
-                    .await?
-                    .ok_or(DataFusionError::Execution(format!(
-                        "No Inverted index found for column {}",
+        let stream = stream::once(async move {
+            let _timer = metrics.baseline_metrics.elapsed_compute().timer();
+            let column = query
+                .column
+                .clone()
+                .ok_or(DataFusionError::Execution(format!(
+                    "column not set for PhraseQuery {}",
+                    query.terms
+                )))?;
+            let index_meta = ds
+                .load_scalar_index(IndexCriteria::default().for_column(&column).supports_fts())
+                .await?
+                .ok_or(DataFusionError::Execution(format!(
+                    "No Inverted index found for column {}",
+                    column,
+                )))?;
+            let uuid = index_meta.uuid.to_string();
+            let index = ds
+                .open_generic_index(&column, &uuid, &metrics.index_metrics)
+                .await?;
+
+            let mut pre_filter = build_prefilter(
+                context.clone(),
+                partition,
+                &prefilter_source,
+                ds.clone(),
+                &[index_meta],
+            )?;
+
+            let index = index
+                .as_any()
+                .downcast_ref::<InvertedIndex>()
+                .ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "Index for column {} is not an inverted index",
                         column,
-                    )))?;
-                let uuid = index_meta.uuid.to_string();
-                let index = ds
-                    .open_generic_index(&column, &uuid, &metrics.index_metrics)
-                    .await?;
-
-                let mut pre_filter = build_prefilter(
-                    context.clone(),
-                    partition,
-                    &prefilter_source,
-                    ds.clone(),
-                    &[index_meta],
-                )?;
-
-                let index = index
-                    .as_any()
-                    .downcast_ref::<InvertedIndex>()
-                    .ok_or_else(|| {
-                        DataFusionError::Execution(format!(
-                            "Index for column {} is not an inverted index",
-                            column,
-                        ))
-                    })?;
-                if !index.deleted_fragments().is_empty() {
-                    Arc::get_mut(&mut pre_filter)
-                        .expect("prefilter just created")
-                        .set_deleted_fragments(index.deleted_fragments().clone());
-                }
-                metrics.record_parts_searched(index.partition_count());
-
-                let mut tokenizer = index.tokenizer();
-                let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
-
-                pre_filter.wait_for_ready().await?;
-                let (doc_ids, scores) = index
-                    .bm25_search(
-                        Arc::new(tokens),
-                        params.into(),
-                        lance_index::scalar::inverted::query::Operator::And,
-                        pre_filter,
-                        metrics.clone(),
-                    )
-                    .boxed()
-                    .await?;
-                metrics.baseline_metrics.record_output(doc_ids.len());
-                let batch = RecordBatch::try_new(
-                    FTS_SCHEMA.clone(),
-                    vec![
-                        Arc::new(UInt64Array::from(doc_ids)),
-                        Arc::new(Float32Array::from(scores)),
-                    ],
-                )?;
-                Ok::<_, DataFusionError>(batch)
+                    ))
+                })?;
+            if !index.deleted_fragments().is_empty() {
+                Arc::get_mut(&mut pre_filter)
+                    .expect("prefilter just created")
+                    .set_deleted_fragments(index.deleted_fragments().clone());
             }
-            .future_in_current_span(),
-        );
+            metrics.record_parts_searched(index.partition_count());
+
+            let mut tokenizer = index.tokenizer();
+            let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
+
+            pre_filter.wait_for_ready().await?;
+            let (doc_ids, scores) = index
+                .bm25_search(
+                    Arc::new(tokens),
+                    params.into(),
+                    lance_index::scalar::inverted::query::Operator::And,
+                    pre_filter,
+                    metrics.clone(),
+                )
+                .boxed()
+                .await?;
+            metrics.baseline_metrics.record_output(doc_ids.len());
+            let batch = RecordBatch::try_new(
+                FTS_SCHEMA.clone(),
+                vec![
+                    Arc::new(UInt64Array::from(doc_ids)),
+                    Arc::new(Float32Array::from(scores)),
+                ],
+            )?;
+            Ok::<_, DataFusionError>(batch)
+        });
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
-            stream.boxed_stream_in_current_span(),
+            stream.stream_in_current_span().boxed(),
         )))
     }
 
@@ -1088,53 +1075,50 @@ impl ExecutionPlan for BoostQueryExec {
         let positive = self.positive.execute(partition, context.clone())?;
         let negative = self.negative.execute(partition, context)?;
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
-        let stream = stream::once(
-            async move {
-                let positive = positive.try_collect::<Vec<_>>().await?;
-                let negative = negative.try_collect::<Vec<_>>().await?;
+        let stream = stream::once(async move {
+            let positive = positive.try_collect::<Vec<_>>().await?;
+            let negative = negative.try_collect::<Vec<_>>().await?;
 
-                let _timer = metrics.baseline_metrics.elapsed_compute().timer();
-                let mut res = HashMap::new();
-                for batch in positive {
-                    let doc_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
-                    let scores = batch[SCORE_COL].as_primitive::<Float32Type>().values();
+            let _timer = metrics.baseline_metrics.elapsed_compute().timer();
+            let mut res = HashMap::new();
+            for batch in positive {
+                let doc_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
+                let scores = batch[SCORE_COL].as_primitive::<Float32Type>().values();
 
-                    for (doc_id, score) in std::iter::zip(doc_ids, scores) {
-                        res.insert(*doc_id, *score);
-                    }
+                for (doc_id, score) in std::iter::zip(doc_ids, scores) {
+                    res.insert(*doc_id, *score);
                 }
-                for batch in negative {
-                    let doc_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
-                    let scores = batch[SCORE_COL].as_primitive::<Float32Type>().values();
-
-                    for (doc_id, neg_score) in std::iter::zip(doc_ids, scores) {
-                        if let Some(score) = res.get_mut(doc_id) {
-                            *score -= query.negative_boost * neg_score;
-                        }
-                    }
-                }
-
-                let (doc_ids, scores): (Vec<_>, Vec<_>) = res
-                    .into_iter()
-                    .sorted_unstable_by(|(_, a), (_, b)| b.total_cmp(a))
-                    .take(params.limit.unwrap_or(usize::MAX))
-                    .unzip();
-                metrics.baseline_metrics.record_output(doc_ids.len());
-
-                let batch = RecordBatch::try_new(
-                    FTS_SCHEMA.clone(),
-                    vec![
-                        Arc::new(UInt64Array::from(doc_ids)),
-                        Arc::new(Float32Array::from(scores)),
-                    ],
-                )?;
-                Ok::<_, DataFusionError>(batch)
             }
-            .future_in_current_span(),
-        );
+            for batch in negative {
+                let doc_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
+                let scores = batch[SCORE_COL].as_primitive::<Float32Type>().values();
+
+                for (doc_id, neg_score) in std::iter::zip(doc_ids, scores) {
+                    if let Some(score) = res.get_mut(doc_id) {
+                        *score -= query.negative_boost * neg_score;
+                    }
+                }
+            }
+
+            let (doc_ids, scores): (Vec<_>, Vec<_>) = res
+                .into_iter()
+                .sorted_unstable_by(|(_, a), (_, b)| b.total_cmp(a))
+                .take(params.limit.unwrap_or(usize::MAX))
+                .unzip();
+            metrics.baseline_metrics.record_output(doc_ids.len());
+
+            let batch = RecordBatch::try_new(
+                FTS_SCHEMA.clone(),
+                vec![
+                    Arc::new(UInt64Array::from(doc_ids)),
+                    Arc::new(Float32Array::from(scores)),
+                ],
+            )?;
+            Ok::<_, DataFusionError>(batch)
+        });
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
-            stream.boxed_stream_in_current_span(),
+            stream.stream_in_current_span().boxed(),
         )))
     }
 
@@ -1314,85 +1298,82 @@ impl ExecutionPlan for BooleanQueryExec {
         let mut must_not = self.must_not.execute(partition, context)?;
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
 
-        let stream = stream::once(
-            async move {
-                let elapsed_time = metrics.baseline_metrics.elapsed_compute();
+        let stream = stream::once(async move {
+            let elapsed_time = metrics.baseline_metrics.elapsed_compute();
 
-                let mut res = HashMap::new();
-                let has_must = must.is_some();
-                if let Some(mut must) = must {
-                    while let Some(batch) = must.try_next().await? {
-                        let _timer = elapsed_time.timer();
-                        let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
-                        let scores = batch[SCORE_COL].as_primitive::<Float32Type>().values();
-                        res.extend(std::iter::zip(
-                            row_ids.iter().copied(),
-                            scores.iter().copied(),
-                        ));
-                    }
-                }
-
-                // add the scores from the should clause
-                while let Some(batch) = should.try_next().await? {
+            let mut res = HashMap::new();
+            let has_must = must.is_some();
+            if let Some(mut must) = must {
+                while let Some(batch) = must.try_next().await? {
                     let _timer = elapsed_time.timer();
                     let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
                     let scores = batch[SCORE_COL].as_primitive::<Float32Type>().values();
-
-                    for (row_id, score) in std::iter::zip(row_ids, scores) {
-                        let entry = res.entry(*row_id).and_modify(|e| *e += score);
-                        if !has_must {
-                            entry.or_insert(*score);
-                        }
-                    }
+                    res.extend(std::iter::zip(
+                        row_ids.iter().copied(),
+                        scores.iter().copied(),
+                    ));
                 }
-
-                // remove the results from the must_not clause
-                while let Some(batch) = must_not.try_next().await? {
-                    let _timer = elapsed_time.timer();
-                    let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
-                    for row_id in row_ids {
-                        res.remove(row_id);
-                    }
-                }
-
-                let mut partitions_searched = 0;
-                for plan in [Some(&should_plan), must_plan.as_ref(), Some(&must_not_plan)] {
-                    let Some(plan) = plan else {
-                        continue;
-                    };
-                    let Some(metrics) = plan.metrics() else {
-                        continue;
-                    };
-                    for (metric_name, count) in metrics.iter_counts() {
-                        if metric_name.as_ref() == PARTITIONS_SEARCHED_METRIC {
-                            partitions_searched += count.value();
-                        }
-                    }
-                }
-                metrics.record_parts_searched(partitions_searched);
-
-                // sort the results and take the top k
-                let _timer = elapsed_time.timer();
-                let (row_ids, scores): (Vec<_>, Vec<_>) = res
-                    .into_iter()
-                    .sorted_unstable_by(|(_, a), (_, b)| b.total_cmp(a))
-                    .take(params.limit.unwrap_or(usize::MAX))
-                    .unzip();
-                metrics.baseline_metrics.record_output(row_ids.len());
-                let batch = RecordBatch::try_new(
-                    FTS_SCHEMA.clone(),
-                    vec![
-                        Arc::new(UInt64Array::from(row_ids)),
-                        Arc::new(Float32Array::from(scores)),
-                    ],
-                )?;
-                Ok::<_, DataFusionError>(batch)
             }
-            .future_in_current_span(),
-        );
+
+            // add the scores from the should clause
+            while let Some(batch) = should.try_next().await? {
+                let _timer = elapsed_time.timer();
+                let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
+                let scores = batch[SCORE_COL].as_primitive::<Float32Type>().values();
+
+                for (row_id, score) in std::iter::zip(row_ids, scores) {
+                    let entry = res.entry(*row_id).and_modify(|e| *e += score);
+                    if !has_must {
+                        entry.or_insert(*score);
+                    }
+                }
+            }
+
+            // remove the results from the must_not clause
+            while let Some(batch) = must_not.try_next().await? {
+                let _timer = elapsed_time.timer();
+                let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
+                for row_id in row_ids {
+                    res.remove(row_id);
+                }
+            }
+
+            let mut partitions_searched = 0;
+            for plan in [Some(&should_plan), must_plan.as_ref(), Some(&must_not_plan)] {
+                let Some(plan) = plan else {
+                    continue;
+                };
+                let Some(metrics) = plan.metrics() else {
+                    continue;
+                };
+                for (metric_name, count) in metrics.iter_counts() {
+                    if metric_name.as_ref() == PARTITIONS_SEARCHED_METRIC {
+                        partitions_searched += count.value();
+                    }
+                }
+            }
+            metrics.record_parts_searched(partitions_searched);
+
+            // sort the results and take the top k
+            let _timer = elapsed_time.timer();
+            let (row_ids, scores): (Vec<_>, Vec<_>) = res
+                .into_iter()
+                .sorted_unstable_by(|(_, a), (_, b)| b.total_cmp(a))
+                .take(params.limit.unwrap_or(usize::MAX))
+                .unzip();
+            metrics.baseline_metrics.record_output(row_ids.len());
+            let batch = RecordBatch::try_new(
+                FTS_SCHEMA.clone(),
+                vec![
+                    Arc::new(UInt64Array::from(row_ids)),
+                    Arc::new(Float32Array::from(scores)),
+                ],
+            )?;
+            Ok::<_, DataFusionError>(batch)
+        });
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
-            stream.boxed_stream_in_current_span(),
+            stream.stream_in_current_span().boxed(),
         )))
     }
 

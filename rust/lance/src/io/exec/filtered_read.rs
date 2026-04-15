@@ -11,6 +11,7 @@ use arrow::array::AsArray;
 use arrow::datatypes::UInt32Type;
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
+use datafusion::common::runtime::SpawnedTask;
 use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -34,7 +35,7 @@ use lance_core::utils::futures::FinallyStreamExt;
 use lance_core::utils::mask::{
     RowAddrMask, RowAddrSelection, RowAddrTreeMap, bitmap_to_ranges, ranges_to_bitmap,
 };
-use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_in_current_span};
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{FutureTracingExt, StreamTracingExt};
 use lance_core::{Error, Result, datatypes::Projection};
 use lance_datafusion::planner::Planner;
@@ -439,8 +440,11 @@ impl FilteredReadStream {
                 move |scoped_fragment| {
                     let metrics = global_metrics_clone.clone();
                     let limit = scan_range_after_filter.as_ref().map(|r| r.end);
-                    spawn_in_current_span(Self::read_fragment(scoped_fragment, metrics, limit))
-                        .map(|thread_result| thread_result.unwrap())
+                    SpawnedTask::spawn(
+                        Self::read_fragment(scoped_fragment, metrics, limit)
+                            .future_in_current_span(),
+                    )
+                    .map(|thread_result| thread_result.unwrap())
                 }
             })
             .buffered(fragment_readahead);

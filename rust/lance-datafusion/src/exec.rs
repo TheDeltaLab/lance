@@ -1095,4 +1095,69 @@ mod tests {
             );
         }
     }
+
+    #[tokio::test]
+    async fn test_join_set_tracer_trace_future() {
+        let tracer = LanceJoinSetTracer;
+        let fut: BoxFuture<'static, Box<dyn Any + Send>> =
+            (async { Box::new(42i32) as Box<dyn Any + Send> }).boxed();
+        let traced_fut = tracer.trace_future(fut);
+        let result = traced_fut.await;
+        assert_eq!(*result.downcast::<i32>().unwrap(), 42);
+    }
+
+    #[test]
+    fn test_join_set_tracer_trace_block() {
+        let tracer = LanceJoinSetTracer;
+        let f: Box<dyn FnOnce() -> Box<dyn Any + Send> + Send> =
+            Box::new(|| Box::new(42i32) as Box<dyn Any + Send>);
+        let traced_f = tracer.trace_block(f);
+        let result = traced_f();
+        assert_eq!(*result.downcast::<i32>().unwrap(), 42);
+    }
+
+    #[test]
+    fn test_traced_exec_display_and_debug() {
+        let schema = Arc::new(ArrowSchema::empty());
+        let input: Arc<dyn ExecutionPlan> = Arc::new(OneShotExec::from_batch(
+            RecordBatch::new_empty(schema),
+        ));
+        let traced = TracedExec::new(input, Span::current());
+
+        // Debug
+        assert_eq!(format!("{:?}", traced), "TracedExec");
+
+        // DisplayAs (all variants should produce "TracedExec")
+        struct Wrapper<'a>(&'a TracedExec, DisplayFormatType);
+        impl<'a> std::fmt::Display for Wrapper<'a> {
+            fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                self.0.fmt_as(self.1, f)
+            }
+        }
+        assert_eq!(
+            format!("{}", Wrapper(&traced, DisplayFormatType::Default)),
+            "TracedExec"
+        );
+        assert_eq!(
+            format!("{}", Wrapper(&traced, DisplayFormatType::Verbose)),
+            "TracedExec"
+        );
+    }
+
+    #[test]
+    fn test_traced_exec_with_new_children() {
+        let schema = Arc::new(ArrowSchema::empty());
+        let input1: Arc<dyn ExecutionPlan> = Arc::new(OneShotExec::from_batch(
+            RecordBatch::new_empty(schema.clone()),
+        ));
+        let input2: Arc<dyn ExecutionPlan> = Arc::new(OneShotExec::from_batch(
+            RecordBatch::new_empty(schema),
+        ));
+
+        let traced = Arc::new(TracedExec::new(input1, Span::current()));
+        let new_traced = traced.with_new_children(vec![input2]).unwrap();
+
+        assert_eq!(new_traced.name(), "TracedExec");
+        assert_eq!(new_traced.children().len(), 1);
+    }
 }

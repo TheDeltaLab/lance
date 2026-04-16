@@ -34,7 +34,7 @@ use lance_arrow::deepcopy::deep_copy_nulls;
 use lance_core::{
     cache::{CacheKey, Context, DeepSizeOf},
     error::{Error, LanceOptionExt},
-    utils::bit::pad_bytes,
+    utils::{bit::pad_bytes, tracing::FutureTracingExt},
 };
 use log::trace;
 
@@ -1940,7 +1940,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
                 has_large_chunk,
             }) as Box<dyn StructuralPageDecoder>)
         }
-        .boxed();
+        .boxed_in_current_span();
         let page_load_task = PageLoadTask {
             decoder_fut: res,
             num_rows,
@@ -2178,7 +2178,7 @@ impl FullZipScheduler {
                 .collect::<VecDeque<_>>();
             Self::create_decoder(details, data, num_rows, bits_per_offset)
         }
-        .boxed();
+        .boxed_in_current_span();
         PageLoadTask {
             decoder_fut: load_task,
             num_rows,
@@ -2320,7 +2320,7 @@ impl FullZipScheduler {
                 let data = source.fetch(&read_ranges, priority).await?;
                 Self::create_decoder(details, data, num_rows, bits_per_offset)
             }
-            .boxed();
+            .boxed_in_current_span();
             let page_load_task = PageLoadTask {
                 decoder_fut: load_task,
                 num_rows,
@@ -2361,7 +2361,7 @@ impl FullZipScheduler {
             let data = source.fetch(&byte_ranges, priority).await?;
             Self::create_decoder(details, data, num_rows, bits_per_offset)
         }
-        .boxed();
+        .boxed_in_current_span();
         let page_load_task = PageLoadTask {
             decoder_fut: load_task,
             num_rows,
@@ -3192,7 +3192,7 @@ impl StructuralSchedulingJob for StructuralPrimitiveFieldSchedulingJob<'_> {
                         path: cur_path,
                     })
                 }
-                .boxed();
+                .boxed_in_current_span();
                 Ok(ScheduledScanLine {
                     decoders: vec![MessageType::UnloadedPage(UnloadedPageShard(unloaded_page))],
                     rows_scheduled: page_load_task.num_rows,

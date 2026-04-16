@@ -223,19 +223,21 @@ use arrow_schema::{ArrowError, DataType, Field as ArrowField, Fields, Schema as 
 use bytes::Bytes;
 use futures::future::{BoxFuture, MaybeDone, maybe_done};
 use futures::stream::{self, BoxStream};
-use futures::{FutureExt, StreamExt};
+use futures::{Future, FutureExt, StreamExt};
 use lance_arrow::DataTypeExt;
 use lance_core::cache::LanceCache;
 use lance_core::datatypes::{BLOB_DESC_LANCE_FIELD, Field, Schema};
 use lance_core::utils::futures::{FinallyStreamExt, StreamOnDropExt};
 use lance_core::utils::parse::parse_env_as_bool;
+use lance_core::utils::tokio::{spawn_in_current_span, spawn_in_span};
+use lance_core::utils::tracing::{FutureTracingExt, StreamTracingExt};
 use log::{debug, trace, warn};
 use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::{self, unbounded_channel};
 
 use lance_core::error::LanceOptionExt;
 use lance_core::{ArrowResult, Error, Result};
-use tracing::instrument;
+use tracing::{Span, instrument};
 
 use crate::compression::{DecompressionStrategy, DefaultDecompressionStrategy};
 use crate::data::DataBlock;
@@ -1333,9 +1335,32 @@ impl DecodeBatchScheduler {
     }
 }
 
+pub type ReadBatchFut = BoxFuture<'static, Result<RecordBatch>>;
+pub type ReadBatchTaskStream = BoxStream<'static, ReadBatchTask>;
+pub type ReadBatchFutStream = BoxStream<'static, ReadBatchFut>;
+
 pub struct ReadBatchTask {
-    pub task: BoxFuture<'static, Result<RecordBatch>>,
+    pub task: ReadBatchFut,
     pub num_rows: u32,
+}
+
+impl ReadBatchTask {
+    pub fn from_future<F>(task: F, num_rows: u32) -> Self
+    where
+        F: Future<Output = Result<RecordBatch>> + Send + 'static,
+    {
+        Self::from_future_in_span(task, num_rows, Span::current())
+    }
+
+    pub fn from_future_in_span<F>(task: F, num_rows: u32, span: Span) -> Self
+    where
+        F: Future<Output = Result<RecordBatch>> + Send + 'static,
+    {
+        Self {
+            task: task.boxed_in_span(span),
+            num_rows,
+        }
+    }
 }
 
 /// A stream that takes scheduled jobs and generates decode tasks from them.
@@ -1463,37 +1488,45 @@ impl BatchDecodeStream {
     }
 
     pub fn into_stream(self) -> BoxStream<'static, ReadBatchTask> {
-        let stream = futures::stream::unfold(self, |mut slf| async move {
-            let next_task = slf.next_batch_task().await;
-            let next_task = next_task.transpose().map(|next_task| {
-                let num_rows = next_task.as_ref().map(|t| t.num_rows).unwrap_or(0);
-                let emitted_batch_size_warning = slf.emitted_batch_size_warning.clone();
-                let task = async move {
-                    let next_task = next_task?;
-                    // Real decode work happens inside into_batch, which can block the current
-                    // thread for a long time. By spawning it as a new task, we allow Tokio's
-                    // worker threads to keep making progress.
-                    let (batch, _data_size) =
-                        tokio::spawn(
+        let stream_span = Span::current();
+        let stream = futures::stream::unfold(self, move |mut slf| {
+            let future_span = stream_span.clone();
+            let task_stream_span = stream_span.clone();
+            async move {
+                let next_task = slf.next_batch_task().await;
+                let next_task = next_task.transpose().map(|next_task| {
+                    let num_rows = next_task.as_ref().map(|t| t.num_rows).unwrap_or(0);
+                    let emitted_batch_size_warning = slf.emitted_batch_size_warning.clone();
+                    let task_span = task_stream_span.clone();
+                    let task = async move {
+                        let next_task = next_task?;
+                        // Real decode work happens inside into_batch, which can block the current
+                        // thread for a long time. By spawning it as a new task, we allow Tokio's
+                        // worker threads to keep making progress.
+                        let (batch, _data_size) = spawn_in_span(
                             async move { next_task.into_batch(emitted_batch_size_warning) },
+                            task_span,
                         )
                         .await
                         .map_err(|err| Error::wrapped(err.into()))??;
-                    Ok(batch)
-                };
-                (task, num_rows)
-            });
-            next_task.map(|(task, num_rows)| {
-                // This should be true since batch size is u32
-                debug_assert!(num_rows <= u32::MAX as u64);
-                let next_task = ReadBatchTask {
-                    task: task.boxed(),
-                    num_rows: num_rows as u32,
-                };
-                (next_task, slf)
-            })
+                        Ok(batch)
+                    };
+                    (task, num_rows)
+                });
+                next_task.map(|(task, num_rows)| {
+                    // This should be true since batch size is u32
+                    debug_assert!(num_rows <= u32::MAX as u64);
+                    let next_task = ReadBatchTask::from_future_in_span(
+                        task,
+                        num_rows as u32,
+                        task_stream_span.clone(),
+                    );
+                    (next_task, slf)
+                })
+            }
+            .boxed_in_span(future_span)
         });
-        stream.boxed()
+        stream.boxed_stream_in_current_span()
     }
 }
 
@@ -1547,6 +1580,7 @@ struct BatchDecodeIterator<T: RootDecoderType> {
     rows_scheduled: u64,
     rows_drained: u64,
     emitted_batch_size_warning: Arc<Once>,
+    span: Span,
     // Note: this is not the runtime on which I/O happens.
     // That's always in the scheduler.  This is just a runtime we use to
     // sleep the current thread if I/O is unready
@@ -1574,6 +1608,7 @@ impl<T: RootDecoderType> BatchDecodeIterator<T> {
                 .build()
                 .unwrap(),
             emitted_batch_size_warning: Arc::new(Once::new()),
+            span: Span::current(),
             schema,
         }
     }
@@ -1675,6 +1710,8 @@ impl<T: RootDecoderType> Iterator for BatchDecodeIterator<T> {
     type Item = ArrowResult<RecordBatch>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        let span = self.span.clone();
+        let _guard = span.enter();
         self.next_batch_task()
             .transpose()
             .map(|r| r.map_err(ArrowError::from))
@@ -1868,57 +1905,66 @@ impl StructuralBatchDecodeStream {
     }
 
     pub fn into_stream(self) -> BoxStream<'static, ReadBatchTask> {
-        let stream = futures::stream::unfold(self, |mut slf| async move {
-            let next_task = slf.next_batch_task().await;
-            let next_task = next_task.transpose().map(|next_task| {
-                let num_rows = next_task.as_ref().map(|t| t.num_rows).unwrap_or(0);
-                let emitted_batch_size_warning = slf.emitted_batch_size_warning.clone();
-                let bytes_per_row_feedback = slf.bytes_per_row_feedback.clone();
-                // Capture the per-stream policy once so every emitted batch task follows the
-                // same throughput-vs-overhead choice made by the scheduler.
-                let spawn_batch_decode_tasks = slf.spawn_batch_decode_tasks;
-                let task = async move {
-                    let next_task = next_task?;
-                    let (batch, data_size) = if spawn_batch_decode_tasks {
-                        tokio::spawn(
-                            async move { next_task.into_batch(emitted_batch_size_warning) },
-                        )
-                        .await
-                        .map_err(|err| Error::wrapped(err.into()))??
-                    } else {
-                        next_task.into_batch(emitted_batch_size_warning)?
-                    };
-                    let num_rows = batch.num_rows() as u64;
-                    if num_rows > 0 {
-                        let bpr = data_size / num_rows;
-                        let prev = bytes_per_row_feedback.load(Ordering::Relaxed);
-                        let next = if prev == 0 || bpr >= prev {
-                            // First batch or actual size is larger than estimate:
-                            // adopt immediately to avoid OOM.
-                            bpr
+        let stream_span = Span::current();
+        let stream = futures::stream::unfold(self, move |mut slf| {
+            let future_span = stream_span.clone();
+            let task_stream_span = stream_span.clone();
+            async move {
+                let next_task = slf.next_batch_task().await;
+                let next_task = next_task.transpose().map(|next_task| {
+                    let num_rows = next_task.as_ref().map(|t| t.num_rows).unwrap_or(0);
+                    let emitted_batch_size_warning = slf.emitted_batch_size_warning.clone();
+                    let bytes_per_row_feedback = slf.bytes_per_row_feedback.clone();
+                    // Capture the per-stream policy once so every emitted batch task follows the
+                    // same throughput-vs-overhead choice made by the scheduler.
+                    let spawn_batch_decode_tasks = slf.spawn_batch_decode_tasks;
+                    let task_span = task_stream_span.clone();
+                    let task = async move {
+                        let next_task = next_task?;
+                        let (batch, data_size) = if spawn_batch_decode_tasks {
+                            spawn_in_span(
+                                async move { next_task.into_batch(emitted_batch_size_warning) },
+                                task_span.clone(),
+                            )
+                            .await
+                            .map_err(|err| Error::wrapped(err.into()))??
                         } else {
-                            // Actual size is smaller: degrade gradually toward
-                            // the true value to avoid over-correcting on a
-                            // single anomalous batch.
-                            (prev + bpr) / 2
+                            next_task.into_batch(emitted_batch_size_warning)?
                         };
-                        bytes_per_row_feedback.store(next.max(1), Ordering::Relaxed);
-                    }
-                    Ok(batch)
-                };
-                (task, num_rows)
-            });
-            next_task.map(|(task, num_rows)| {
-                // This should be true since batch size is u32
-                debug_assert!(num_rows <= u32::MAX as u64);
-                let next_task = ReadBatchTask {
-                    task: task.boxed(),
-                    num_rows: num_rows as u32,
-                };
-                (next_task, slf)
-            })
+                        let num_rows = batch.num_rows() as u64;
+                        if num_rows > 0 {
+                            let bpr = data_size / num_rows;
+                            let prev = bytes_per_row_feedback.load(Ordering::Relaxed);
+                            let next = if prev == 0 || bpr >= prev {
+                                // First batch or actual size is larger than estimate:
+                                // adopt immediately to avoid OOM.
+                                bpr
+                            } else {
+                                // Actual size is smaller: degrade gradually toward
+                                // the true value to avoid over-correcting on a
+                                // single anomalous batch.
+                                (prev + bpr) / 2
+                            };
+                            bytes_per_row_feedback.store(next.max(1), Ordering::Relaxed);
+                        }
+                        Ok(batch)
+                    };
+                    (task, num_rows)
+                });
+                next_task.map(|(task, num_rows)| {
+                    // This should be true since batch size is u32
+                    debug_assert!(num_rows <= u32::MAX as u64);
+                    let next_task = ReadBatchTask::from_future_in_span(
+                        task,
+                        num_rows as u32,
+                        task_stream_span.clone(),
+                    );
+                    (next_task, slf)
+                })
+            }
+            .boxed_in_span(future_span)
         });
-        stream.boxed()
+        stream.boxed_stream_in_current_span()
     }
 }
 
@@ -2012,7 +2058,7 @@ fn check_scheduler_on_drop(
             // ScanScheduler to drop and cancel pending I/O.
             abort_handle.abort();
         })
-        .boxed()
+        .boxed_stream_in_current_span()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2120,7 +2166,7 @@ fn create_scheduler_decoder(
         config.batch_size_bytes,
     )?;
 
-    let scheduler_handle = tokio::task::spawn(async move {
+    let scheduler_handle = spawn_in_current_span(async move {
         let mut decode_scheduler = match DecodeBatchScheduler::try_new(
             target_schema.as_ref(),
             &column_indices,
@@ -2169,7 +2215,7 @@ pub fn schedule_and_decode(
     config: SchedulerDecoderConfig,
 ) -> BoxStream<'static, ReadBatchTask> {
     if requested_rows.num_rows() == 0 {
-        return stream::empty().boxed();
+        return stream::empty().boxed_stream_in_current_span();
     }
 
     // If the user requested any ranges that are empty, ignore them.  They are pointless and
@@ -2191,13 +2237,15 @@ pub fn schedule_and_decode(
     ) {
         // Keep the io alive until the stream is dropped or finishes.  Otherwise the
         // I/O drops as soon as the scheduling is finished and the I/O loop terminates.
-        Ok(stream) => stream.finally(move || drop(io)).boxed(),
+        Ok(stream) => stream
+            .finally(move || drop(io))
+            .boxed_stream_in_current_span(),
         // If the initialization failed make it look like a failed task
-        Err(e) => stream::once(std::future::ready(ReadBatchTask {
-            num_rows: 0,
-            task: std::future::ready(Err(e)).boxed(),
-        }))
-        .boxed(),
+        Err(e) => stream::once(std::future::ready(ReadBatchTask::from_future(
+            std::future::ready(Err(e)),
+            0,
+        )))
+        .boxed_stream_in_current_span(),
     }
 }
 

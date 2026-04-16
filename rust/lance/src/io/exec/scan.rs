@@ -24,14 +24,13 @@ use futures::stream::{BoxStream, Stream};
 use futures::{FutureExt, TryFutureExt, stream};
 use futures::{StreamExt, TryStreamExt};
 use lance_arrow::SchemaExt;
-use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::utils::tracing::StreamTracingExt;
+use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_in_current_span};
+use lance_core::utils::tracing::{FutureTracingExt, StreamTracingExt};
 use lance_core::{Error, ROW_ADDR_FIELD, ROW_ID_FIELD};
-use lance_file::reader::FileReaderOptions;
+use lance_file::reader::{FileReaderOptions, ReadBatchFutStream};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_table::format::Fragment;
 use log::debug;
-use tracing::Instrument;
 
 use crate::dataset::Dataset;
 use crate::dataset::fragment::{FileFragment, FragReadConfig, FragmentReader};
@@ -284,44 +283,39 @@ impl LanceStream {
                 #[allow(clippy::type_complexity)]
                 let frag_task: BoxFuture<
                     Result<BoxStream<Result<BoxFuture<Result<RecordBatch>>>>>,
-                > = tokio::spawn(
-                    (async move {
-                        let mut frag_config = FragReadConfig::default()
-                            .with_row_id(config.with_row_id)
-                            .with_row_address(config.with_row_address)
-                            .with_row_last_updated_at_version(
-                                config.with_row_last_updated_at_version,
-                            )
-                            .with_row_created_at_version(config.with_row_created_at_version);
-                        if let Some(file_reader_options) = config.file_reader_options {
-                            frag_config = frag_config.with_file_reader_options(file_reader_options);
-                        }
-                        let reader = open_file(
-                            file_fragment.fragment,
-                            project_schema,
-                            frag_config,
-                            config.with_make_deletions_null,
-                            Some((scan_scheduler, priority as u32)),
-                        )
-                        .await?;
-                        let batch_stream = if let Some(range) = file_fragment.range {
-                            reader.read_range(range, config.batch_size as u32)?.boxed()
-                        } else {
-                            reader.read_all(config.batch_size as u32)?.boxed()
-                        };
-                        let batch_stream: BoxStream<Result<BoxFuture<Result<RecordBatch>>>> =
-                            batch_stream
-                                .map(|fut| {
-                                    Result::Ok(
-                                        fut.map_err(|e| DataFusionError::External(Box::new(e)))
-                                            .boxed(),
-                                    )
-                                })
-                                .boxed();
-                        Result::Ok(batch_stream)
-                    })
-                    .in_current_span(),
-                )
+                > = spawn_in_current_span(async move {
+                    let mut frag_config = FragReadConfig::default()
+                        .with_row_id(config.with_row_id)
+                        .with_row_address(config.with_row_address)
+                        .with_row_last_updated_at_version(config.with_row_last_updated_at_version)
+                        .with_row_created_at_version(config.with_row_created_at_version);
+                    if let Some(file_reader_options) = config.file_reader_options {
+                        frag_config = frag_config.with_file_reader_options(file_reader_options);
+                    }
+                    let reader = open_file(
+                        file_fragment.fragment,
+                        project_schema,
+                        frag_config,
+                        config.with_make_deletions_null,
+                        Some((scan_scheduler, priority as u32)),
+                    )
+                    .await?;
+                    let batch_stream = if let Some(range) = file_fragment.range {
+                        reader.read_range(range, config.batch_size as u32)?.boxed()
+                    } else {
+                        reader.read_all(config.batch_size as u32)?.boxed()
+                    };
+                    let batch_stream: BoxStream<Result<BoxFuture<Result<RecordBatch>>>> =
+                        batch_stream
+                            .map(|fut| {
+                                Result::Ok(
+                                    fut.map_err(|e| DataFusionError::External(Box::new(e)))
+                                        .boxed_in_current_span(),
+                                )
+                            })
+                            .boxed_stream_in_current_span();
+                    Result::Ok(batch_stream)
+                })
                 .map(|res_res| res_res.unwrap())
                 .boxed();
                 Ok(frag_task)
@@ -340,8 +334,7 @@ impl LanceStream {
             // us fully fuse decode into the first half of the plan.  Currently there is likely to be a thread
             // transfer between the two steps.
             .try_buffered(get_num_compute_intensive_cpus())
-            .stream_in_current_span()
-            .boxed();
+            .boxed_stream_in_current_span();
 
         timer.done();
         Ok(Self {
@@ -393,14 +386,15 @@ impl LanceStream {
                             .with_row_created_at_version(config.with_row_created_at_version),
                         config.with_make_deletions_null,
                         None,
-                    ))
+                    )
+                    .future_in_current_span())
                 })
                 .try_buffered(fragment_readahead);
             let tasks = readers.and_then(move |reader| {
                 std::future::ready(
                     reader
                         .read_all(config.batch_size as u32)
-                        .map(|task_stream| task_stream.map(Ok))
+                        .map(|task_stream: ReadBatchFutStream| task_stream.map(Ok))
                         .map_err(DataFusionError::from),
                 )
             });
@@ -409,8 +403,7 @@ impl LanceStream {
                 .try_flatten()
                 // We buffer up to `batch_readahead` batches across all streams.
                 .try_buffered(config.batch_readahead)
-                .stream_in_current_span()
-                .boxed()
+                .boxed_stream_in_current_span()
         } else {
             let readers = stream::iter(file_fragments)
                 .map(move |file_fragment| {
@@ -426,14 +419,15 @@ impl LanceStream {
                             .with_row_created_at_version(config.with_row_created_at_version),
                         config.with_make_deletions_null,
                         None,
-                    ))
+                    )
+                    .future_in_current_span())
                 })
                 .try_buffered(fragment_readahead);
             let tasks = readers.and_then(move |reader| {
                 std::future::ready(
                     reader
                         .read_all(config.batch_size as u32)
-                        .map(|task_stream| task_stream.map(Ok))
+                        .map(|task_stream: ReadBatchFutStream| task_stream.map(Ok))
                         .map_err(DataFusionError::from),
                 )
             });
@@ -443,8 +437,7 @@ impl LanceStream {
                 .try_flatten_unordered(config.fragment_readahead)
                 // We buffer up to `batch_readahead` batches across all streams.
                 .try_buffer_unordered(config.batch_readahead)
-                .stream_in_current_span()
-                .boxed()
+                .boxed_stream_in_current_span()
         };
 
         let inner_stream = Box::pin(batches.map_err(|e| DataFusionError::External(Box::new(e))))
@@ -698,12 +691,13 @@ impl ExecutionPlan for LanceScanExec {
         let config = self.config.clone();
         let metrics = self.metrics.clone();
 
-        let lance_fut_stream = stream::once(async move {
+        let lance_stream = stream::once(async move {
             LanceStream::try_new(
                 dataset, fragments, range, projection, config, &metrics, partition,
             )
-        });
-        let lance_stream = lance_fut_stream.try_flatten();
+        })
+        .boxed_stream_in_current_span()
+        .try_flatten();
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
             lance_stream,

@@ -36,6 +36,7 @@ use lance_core::utils::mask::{
     RowAddrMask, RowAddrSelection, RowAddrTreeMap, bitmap_to_ranges, ranges_to_bitmap,
 };
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
+use lance_core::utils::tracing::{FutureTracingExt, StreamTracingExt};
 use lance_core::{Error, Result, datatypes::Projection};
 use lance_datafusion::planner::Planner;
 use lance_datafusion::utils::{
@@ -440,13 +441,16 @@ impl FilteredReadStream {
                     let metrics = global_metrics_clone.clone();
                     let limit = scan_range_after_filter.as_ref().map(|r| r.end);
                     SpawnedTask::spawn(
-                        Self::read_fragment(scoped_fragment, metrics, limit).in_current_span(),
+                        Self::read_fragment(scoped_fragment, metrics, limit)
+                            .future_in_current_span(),
                     )
                     .map(|thread_result| thread_result.unwrap())
                 }
             })
             .buffered(fragment_readahead);
-        let task_stream = fragment_streams.try_flatten().boxed();
+        let task_stream = fragment_streams
+            .try_flatten()
+            .boxed_stream_in_current_span();
 
         Ok(Self {
             output_schema,
@@ -975,10 +979,11 @@ impl FilteredReadStream {
                         });
 
                 let batch_stream = if let Some(ref range) = self.scan_range_after_filter {
-                    Self::apply_hard_range(base_batch_stream, range.clone()).boxed()
+                    Self::apply_hard_range(base_batch_stream, range.clone())
+                        .boxed_stream_in_current_span()
                 } else {
                     // Need to box here otherwise the if/else returns incompatible types
-                    base_batch_stream.boxed()
+                    base_batch_stream.boxed_stream_in_current_span()
                 };
 
                 let batch_stream = batch_stream
@@ -992,7 +997,7 @@ impl FilteredReadStream {
                         partition_metrics.baseline_metrics.done();
                     })
                     .map_err(|e: lance_core::Error| DataFusionError::External(e.into()))
-                    .boxed();
+                    .boxed_stream_in_current_span();
 
                 Box::pin(RecordBatchStreamAdapter::new(output_schema, batch_stream))
             }
@@ -1044,7 +1049,8 @@ impl FilteredReadStream {
                         Some(batch)
                     }))
                 })
-                .map_err(|e: lance_core::Error| DataFusionError::External(e.into()));
+                .map_err(|e: lance_core::Error| DataFusionError::External(e.into()))
+                .boxed_stream_in_current_span();
                 Box::pin(RecordBatchStreamAdapter::new(output_schema, batch_stream))
             }
         }
@@ -1127,13 +1133,14 @@ impl FilteredReadStream {
                             global_metrics.ranges_scanned.add(additional_ranges);
                         }
                     })
-                    .boxed()
+                    .boxed_in_current_span()
             })
             .zip(futures::stream::repeat((
                 physical_filter.clone(),
                 output_schema.clone(),
             )))
-            .map(|(batch_fut, args)| Self::wrap_with_filter(batch_fut, args.0, args.1));
+            .map(|(batch_fut, args)| Self::wrap_with_filter(batch_fut, args.0, args.1))
+            .boxed_stream_in_current_span();
 
         let result: Pin<Box<dyn Stream<Item = Result<ReadBatchFut>> + Send>> =
             if let Some(limit) = fragment_soft_limit {
@@ -1162,7 +1169,7 @@ impl FilteredReadStream {
                     // Drop any fields loaded purely for the purpose of applying the filter
                     Ok(batch.project_by_schema(output_schema.as_ref())?)
                 })
-                .boxed())
+                .boxed_in_current_span())
         } else {
             Ok(batch_fut)
         }
@@ -1170,7 +1177,7 @@ impl FilteredReadStream {
 
     fn apply_soft_limit<S>(stream: S, limit: u64) -> impl Stream<Item = Result<ReadBatchFut>>
     where
-        S: Stream<Item = Result<ReadBatchFut>>,
+        S: Stream<Item = Result<ReadBatchFut>> + Send + 'static,
     {
         let rows_read = Arc::new(AtomicUsize::new(0));
 
@@ -1189,9 +1196,10 @@ impl FilteredReadStream {
                                 rows_read.fetch_add(batch_rows, Ordering::Relaxed);
                             })
                         })
-                        .boxed()
+                        .boxed_in_current_span()
                 })
             })
+            .boxed_stream_in_current_span()
     }
 
     fn apply_hard_range<S>(stream: S, range: Range<u64>) -> impl Stream<Item = Result<RecordBatch>>
@@ -1734,7 +1742,8 @@ impl FilteredReadExec {
                 DataFusionResult::Ok(first_stream)
             }
         })
-        .try_flatten();
+        .try_flatten()
+        .boxed_stream_in_current_span();
 
         Box::pin(RecordBatchStreamAdapter::new(self.schema(), stream))
     }

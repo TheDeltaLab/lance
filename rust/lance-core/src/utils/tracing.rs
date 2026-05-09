@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use futures::Stream;
+use futures::{Future, FutureExt, Stream, StreamExt, future::BoxFuture, stream::BoxStream};
 use pin_project::pin_project;
-use tracing::Span;
+use tracing::{Instrument, Span};
 
 #[pin_project]
 pub struct InstrumentedStream<I: Stream> {
@@ -27,6 +27,63 @@ impl<I: Stream> Stream for InstrumentedStream<I> {
 
 // It would be nice to call the method in_current_span but sadly the Instrumented trait in
 // the tracing crate already stole the name for all Sized types
+pub trait FutureTracingExt {
+    /// All calls to poll the future will be done in the context of the current span (when this method is called)
+    fn future_in_current_span(self) -> tracing::instrument::Instrumented<Self>
+    where
+        Self: Future,
+        Self: Sized;
+
+    fn future_in_span(self, span: Span) -> tracing::instrument::Instrumented<Self>
+    where
+        Self: Future,
+        Self: Sized;
+
+    fn boxed_in_current_span(self) -> BoxFuture<'static, <Self as Future>::Output>
+    where
+        Self: Future + Send + 'static,
+        Self: Sized;
+
+    fn boxed_in_span(self, span: Span) -> BoxFuture<'static, <Self as Future>::Output>
+    where
+        Self: Future + Send + 'static,
+        Self: Sized;
+}
+
+impl<F: Future> FutureTracingExt for F {
+    fn future_in_current_span(self) -> tracing::instrument::Instrumented<Self>
+    where
+        Self: Future,
+        Self: Sized,
+    {
+        self.future_in_span(Span::current())
+    }
+
+    fn future_in_span(self, span: Span) -> tracing::instrument::Instrumented<Self>
+    where
+        Self: Future,
+        Self: Sized,
+    {
+        self.instrument(span)
+    }
+
+    fn boxed_in_current_span(self) -> BoxFuture<'static, <Self as Future>::Output>
+    where
+        Self: Future + Send + 'static,
+        Self: Sized,
+    {
+        self.boxed_in_span(Span::current())
+    }
+
+    fn boxed_in_span(self, span: Span) -> BoxFuture<'static, <Self as Future>::Output>
+    where
+        Self: Future + Send + 'static,
+        Self: Sized,
+    {
+        self.instrument(span).boxed()
+    }
+}
+
 pub trait StreamTracingExt {
     /// All calls to poll the stream will be done in the context of the current span (when this method is called)
     fn stream_in_current_span(self) -> InstrumentedStream<Self>
@@ -37,6 +94,16 @@ pub trait StreamTracingExt {
     fn stream_in_span(self, span: Span) -> InstrumentedStream<Self>
     where
         Self: Stream,
+        Self: Sized;
+
+    fn boxed_stream_in_current_span(self) -> BoxStream<'static, <Self as Stream>::Item>
+    where
+        Self: Stream + Send + 'static,
+        Self: Sized;
+
+    fn boxed_stream_in_span(self, span: Span) -> BoxStream<'static, <Self as Stream>::Item>
+    where
+        Self: Stream + Send + 'static,
         Self: Sized;
 }
 
@@ -55,6 +122,22 @@ impl<S: Stream> StreamTracingExt for S {
         Self: Sized,
     {
         InstrumentedStream { stream: self, span }
+    }
+
+    fn boxed_stream_in_current_span(self) -> BoxStream<'static, <Self as Stream>::Item>
+    where
+        Self: Stream + Send + 'static,
+        Self: Sized,
+    {
+        self.boxed_stream_in_span(Span::current())
+    }
+
+    fn boxed_stream_in_span(self, span: Span) -> BoxStream<'static, <Self as Stream>::Item>
+    where
+        Self: Stream + Send + 'static,
+        Self: Sized,
+    {
+        self.stream_in_span(span).boxed()
     }
 }
 

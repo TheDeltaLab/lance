@@ -22,6 +22,7 @@ fn create_datafusion_context() -> SessionContext {
 
 mod inverted;
 mod primitives;
+mod tracing;
 mod vectors;
 
 /// Scanning and ordering by id should give same result as original.

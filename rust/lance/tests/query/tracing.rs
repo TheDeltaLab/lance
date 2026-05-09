@@ -404,6 +404,7 @@ async fn test_hybrid_fts_vector_rerank_does_not_create_orphan_spans() {
         metric_type: Some(MetricType::L2),
         use_index: true,
         dist_q_c: 0.0,
+        query_parallelism: 0,
     };
 
     assert_query_has_no_orphan_spans(async {
@@ -482,6 +483,7 @@ async fn test_local_hybrid_fts_vector_rerank_does_not_create_orphan_spans() {
         metric_type: Some(MetricType::L2),
         use_index: true,
         dist_q_c: 0.0,
+        query_parallelism: 0,
     };
 
     assert_query_has_no_orphan_spans(async {

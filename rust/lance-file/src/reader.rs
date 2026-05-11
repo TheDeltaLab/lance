@@ -916,7 +916,7 @@ impl FileReader {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn do_read_range(
+    async fn do_read_range(
         column_infos: Vec<Arc<ColumnInfo>>,
         io: Arc<dyn EncodingsIo>,
         cache: Arc<LanceCache>,
@@ -949,17 +949,18 @@ impl FileReader {
 
         let requested_rows = RequestedRows::Ranges(vec![range]);
 
-        Ok(schedule_and_decode(
+        schedule_and_decode(
             column_infos,
             requested_rows,
             filter,
             projection.column_indices,
             projection.schema,
             config,
-        ))
+        )
+        .await
     }
 
-    fn read_range(
+    async fn read_range(
         &self,
         range: Range<u64>,
         batch_size: u32,
@@ -980,10 +981,11 @@ impl FileReader {
             self.options.decoder_config.clone(),
             self.options.batch_size_bytes,
         )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn do_take_rows(
+    async fn do_take_rows(
         column_infos: Vec<Arc<ColumnInfo>>,
         io: Arc<dyn EncodingsIo>,
         cache: Arc<LanceCache>,
@@ -1015,17 +1017,18 @@ impl FileReader {
 
         let requested_rows = RequestedRows::Indices(indices);
 
-        Ok(schedule_and_decode(
+        schedule_and_decode(
             column_infos,
             requested_rows,
             filter,
             projection.column_indices,
             projection.schema,
             config,
-        ))
+        )
+        .await
     }
 
-    fn take_rows(
+    async fn take_rows(
         &self,
         indices: Vec<u64>,
         batch_size: u32,
@@ -1044,10 +1047,11 @@ impl FileReader {
             self.options.decoder_config.clone(),
             self.options.batch_size_bytes,
         )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn do_read_ranges(
+    async fn do_read_ranges(
         column_infos: Vec<Arc<ColumnInfo>>,
         io: Arc<dyn EncodingsIo>,
         cache: Arc<LanceCache>,
@@ -1081,17 +1085,18 @@ impl FileReader {
 
         let requested_rows = RequestedRows::Ranges(ranges);
 
-        Ok(schedule_and_decode(
+        schedule_and_decode(
             column_infos,
             requested_rows,
             filter,
             projection.column_indices,
             projection.schema,
             config,
-        ))
+        )
+        .await
     }
 
-    fn read_ranges(
+    async fn read_ranges(
         &self,
         ranges: Vec<Range<u64>>,
         batch_size: u32,
@@ -1110,6 +1115,7 @@ impl FileReader {
             self.options.decoder_config.clone(),
             self.options.batch_size_bytes,
         )
+        .await
     }
 
     /// Creates a stream of "read tasks" to read the data from the file
@@ -1122,7 +1128,20 @@ impl FileReader {
     /// Note that "read task" is probably a bit imprecise.  The tasks are actually "decode tasks".  The
     /// reading happens asynchronously in the background.  In other words, a single read task may map to
     /// multiple I/O operations or a single I/O operation may map to multiple read tasks.
-    pub fn read_tasks(
+    ///
+    /// # Why is this async?
+    ///
+    /// Constructing the read stream requires running the decode scheduler's
+    /// `initialize` step, which performs the metadata I/O (chunk metadata,
+    /// dictionaries, repetition index, ...) needed to plan the read.  We
+    /// drive that I/O on the awaiting task rather than smuggling it into
+    /// the stream's first poll.  This way callers control where the
+    /// scheduling I/O runs (typically inside a per-fragment
+    /// `tokio::spawn`), planning errors surface from the await instead of
+    /// from the first stream item, and small reads can also complete the
+    /// synchronous scheduling step before returning (see
+    /// [`DecoderConfig::inline_scheduling`]).
+    pub async fn read_tasks(
         &self,
         params: ReadBatchParams,
         batch_size: u32,
@@ -1154,7 +1173,7 @@ impl FileReader {
                     }
                 }
                 let indices = indices.iter().map(|idx| idx.unwrap() as u64).collect();
-                self.take_rows(indices, batch_size, projection)
+                self.take_rows(indices, batch_size, projection).await
             }
             ReadBatchParams::Range(range) => {
                 verify_bound(&params, range.end as u64, false)?;
@@ -1164,6 +1183,7 @@ impl FileReader {
                     projection,
                     filter,
                 )
+                .await
             }
             ReadBatchParams::Ranges(ranges) => {
                 let mut ranges_u64 = Vec::with_capacity(ranges.len());
@@ -1172,6 +1192,7 @@ impl FileReader {
                     ranges_u64.push(range.start..range.end);
                 }
                 self.read_ranges(ranges_u64, batch_size, projection, filter)
+                    .await
             }
             ReadBatchParams::RangeFrom(range) => {
                 verify_bound(&params, range.start as u64, true)?;
@@ -1181,13 +1202,16 @@ impl FileReader {
                     projection,
                     filter,
                 )
+                .await
             }
             ReadBatchParams::RangeTo(range) => {
                 verify_bound(&params, range.end as u64, false)?;
                 self.read_range(0..range.end as u64, batch_size, projection, filter)
+                    .await
             }
             ReadBatchParams::RangeFull => {
                 self.read_range(0..self.num_rows, batch_size, projection, filter)
+                    .await
             }
         }
     }
@@ -1213,7 +1237,15 @@ impl FileReader {
     /// * `projection` - A projection to apply to the read.  This controls which columns
     ///   are read from the file.  The projection is NOT applied on top of the base
     ///   projection.  The projection is applied directly to the file schema.
-    pub fn read_stream_projected(
+    ///
+    /// # Why is this async?
+    ///
+    /// This delegates to [`Self::read_tasks`], which awaits the decode
+    /// scheduler's `initialize` step (and, for small reads, the synchronous
+    /// scheduling that follows) before returning.  See `read_tasks` for
+    /// details on why this work is performed up front rather than on the
+    /// stream's first poll.
+    pub async fn read_stream_projected(
         &self,
         params: ReadBatchParams,
         batch_size: u32,
@@ -1222,7 +1254,9 @@ impl FileReader {
         filter: FilterExpression,
     ) -> Result<Pin<Box<dyn RecordBatchStream>>> {
         let arrow_schema = Arc::new(ArrowSchema::from(projection.schema.as_ref()));
-        let tasks_stream = self.read_tasks(params, batch_size, Some(projection), filter)?;
+        let tasks_stream = self
+            .read_tasks(params, batch_size, Some(projection), filter)
+            .await?;
         let batch_stream = tasks_stream
             .map(|task| task.task)
             .buffered(batch_readahead as usize)
@@ -1437,7 +1471,13 @@ impl FileReader {
     /// This is similar to [`Self::read_stream_projected`] but uses the base projection
     /// provided when the file was opened (or reads all columns if the file was
     /// opened without a base projection)
-    pub fn read_stream(
+    ///
+    /// # Why is this async?
+    ///
+    /// This delegates to [`Self::read_stream_projected`], which awaits the
+    /// decode scheduler's `initialize` step before returning the stream.
+    /// See [`Self::read_tasks`] for the rationale.
+    pub async fn read_stream(
         &self,
         params: ReadBatchParams,
         batch_size: u32,
@@ -1451,6 +1491,7 @@ impl FileReader {
             self.base_projection.clone(),
             filter,
         )
+        .await
     }
 
     pub fn schema(&self) -> &Arc<Schema> {
@@ -1750,6 +1791,7 @@ mod tests {
                     16,
                     FilterExpression::no_filter(),
                 )
+                .await
                 .unwrap();
 
             verify_expected(&data, batch_stream, read_size, None).await;
@@ -1900,6 +1942,7 @@ mod tests {
                         projection.clone(),
                         FilterExpression::no_filter(),
                     )
+                    .await
                     .unwrap();
 
                 let projection_arrow = ArrowSchema::from(projection.schema.as_ref());
@@ -1931,6 +1974,7 @@ mod tests {
                         16,
                         FilterExpression::no_filter(),
                     )
+                    .await
                     .unwrap();
 
                 let projection_arrow = ArrowSchema::from(projection.schema.as_ref());
@@ -1953,6 +1997,7 @@ mod tests {
                             empty_projection.clone(),
                             FilterExpression::no_filter(),
                         )
+                        .await
                         .is_err()
                 );
             }
@@ -2035,6 +2080,7 @@ mod tests {
                 projection.clone(),
                 FilterExpression::no_filter(),
             )
+            .await
             .unwrap();
 
         let projection_arrow = Arc::new(ArrowSchema::from(projection.schema.as_ref()));
@@ -2077,6 +2123,7 @@ mod tests {
                 16,
                 FilterExpression::no_filter(),
             )
+            .await
             .unwrap()
             .try_collect::<Vec<_>>()
             .await
@@ -2158,6 +2205,7 @@ mod tests {
                 16,
                 FilterExpression::no_filter(),
             )
+            .await
             .unwrap();
 
         drop(file_reader);
@@ -2267,6 +2315,7 @@ mod tests {
                 16,
                 FilterExpression::no_filter(),
             )
+            .await
             .unwrap()
             .try_collect::<Vec<_>>()
             .await
@@ -2282,6 +2331,7 @@ mod tests {
                 16,
                 FilterExpression::no_filter(),
             )
+            .await
             .unwrap()
             .try_collect::<Vec<_>>()
             .await

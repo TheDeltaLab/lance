@@ -219,10 +219,14 @@ async fn profile_event_for_vector_search_includes_index_phases() {
     let oi_vec = parse_u64(s.get("phase_open_index_vector_us").unwrap());
     let oi_roll = parse_u64(s.get("phase_open_index_us").unwrap());
     assert!(oi_vec > 0, "open_index.vector should be > 0: {s:?}");
-    assert_eq!(oi_roll, oi_vec + parse_u64(s.get("phase_open_index_scalar_us").unwrap())
-        + parse_u64(s.get("phase_open_index_frag_reuse_us").unwrap())
-        + parse_u64(s.get("phase_open_index_mem_wal_us").unwrap()),
-        "rollup must equal sum of sub-phases: {s:?}");
+    assert_eq!(
+        oi_roll,
+        oi_vec
+            + parse_u64(s.get("phase_open_index_scalar_us").unwrap())
+            + parse_u64(s.get("phase_open_index_frag_reuse_us").unwrap())
+            + parse_u64(s.get("phase_open_index_mem_wal_us").unwrap()),
+        "rollup must equal sum of sub-phases: {s:?}"
+    );
     assert!(
         parse_u64(s.get("phase_index_search_ann_us").unwrap()) > 0,
         "ann sub-phase should be > 0: {s:?}"

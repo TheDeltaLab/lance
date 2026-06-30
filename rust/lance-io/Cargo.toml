@@ -60,6 +60,7 @@ rstest.workspace = true
 mock_instant.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tracing-mock = { workspace = true }
+tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
 
 [[bench]]
 name = "scheduler"

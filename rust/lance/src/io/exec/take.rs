@@ -29,10 +29,13 @@ use lance_core::datatypes::{Field, OnMissing, Projection};
 use lance_core::error::{DataFusionResult, LanceOptionExt};
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::futures::FinallyStreamExt;
-use lance_core::utils::tokio::get_num_compute_intensive_cpus;
+use lance_core::utils::{
+    tokio::{get_num_compute_intensive_cpus, spawn_in_current_span},
+    tracing::{FutureTracingExt, PHASE_LOAD_DATA_TAKE, StreamTracingExt},
+};
 use lance_core::{ROW_ADDR, ROW_ID};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
-use tracing::error;
+use tracing::{error, info_span};
 
 use crate::dataset::Dataset;
 use crate::dataset::fragment::{FragReadConfig, FragmentReader};
@@ -291,7 +294,7 @@ impl TakeStream {
                     let offsets = std::mem::take(&mut current_offsets);
                     futures.push_back(
                         async move { reader.take_as_batch(&offsets, Some(batch_number)).await }
-                            .boxed(),
+                            .boxed_in_current_span(),
                     );
                 }
                 current_fragment_id = Some(addr.fragment_id());
@@ -309,7 +312,7 @@ impl TakeStream {
                         .take_as_batch(&current_offsets, Some(batch_number))
                         .await
                 }
-                .boxed(),
+                .boxed_in_current_span(),
             );
         }
 
@@ -372,11 +375,11 @@ impl TakeStream {
                 let batch = batch?;
                 let this = self.clone();
                 Ok(
-                    tokio::task::spawn(this.map_batch(batch, batch_index as u32))
+                    spawn_in_current_span(this.map_batch(batch, batch_index as u32))
                         .map(|res| res.unwrap()),
                 )
             })
-            .boxed();
+            .boxed_stream_in_current_span();
         batches
             .try_buffered(get_num_compute_intensive_cpus())
             .map(move |result| {
@@ -396,6 +399,7 @@ impl TakeStream {
                 final_metrics.baseline_metrics.done();
                 final_metrics.io_metrics.record(&final_scan_scheduler);
             })
+            .stream_in_current_span()
     }
 }
 
@@ -650,9 +654,13 @@ impl ExecutionPlan for TakeExec {
             take_stream.apply(input_stream)
         });
         let output_schema = self.output_schema.clone();
+        let stream = lazy_take_stream
+            .flatten()
+            .boxed_stream_in_current_span()
+            .stream_in_span(info_span!(PHASE_LOAD_DATA_TAKE));
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             output_schema,
-            lazy_take_stream.flatten(),
+            stream,
         )))
     }
 

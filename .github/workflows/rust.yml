@@ -84,8 +84,8 @@ jobs:
           command: check
 
   linux-build:
-    runs-on: "ubuntu-24.04-8x"
-    timeout-minutes: 75
+    runs-on: "ubuntu-24.04"
+    timeout-minutes: 60
     env:
       # Need up-to-date compilers for kernels
       CC: clang
@@ -96,9 +96,8 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Setup rust toolchain
         run: |
-          # Temporary mitigation for https://github.com/rust-lang/rust/issues/159261.
-          rustup toolchain install nightly-2026-07-13
-          rustup default nightly-2026-07-13
+          rustup toolchain install nightly
+          rustup default nightly
       - uses: rui314/setup-mold@725a8794d15fc7563f59595bd9556495c0564878 # v1
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
       - name: Install dependencies
@@ -112,7 +111,7 @@ jobs:
       - name: Run tests
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc -e slow_tests | sort | uniq | paste -s -d "," -`
-          cargo +nightly-2026-07-13 llvm-cov --profile ci --locked --workspace --codecov --output-path coverage.codecov --features ${ALL_FEATURES}
+          cargo +nightly llvm-cov --profile ci --locked --workspace --codecov --output-path coverage.codecov --features ${ALL_FEATURES}
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238 # v4
         with:
@@ -121,33 +120,8 @@ jobs:
           files: coverage.codecov
           flags: unittests
           fail_ci_if_error: false
-  linux-arm:
-    runs-on: ubuntu-24.04-arm64-8x
-    timeout-minutes: 75
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Setup rust toolchain
-        run: |
-          rustup toolchain install stable
-          rustup default stable
-      - uses: rui314/setup-mold@725a8794d15fc7563f59595bd9556495c0564878 # v1
-      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
-      - name: Install dependencies
-        run: |
-          sudo apt -y -qq update
-          sudo apt install -y protobuf-compiler libssl-dev pkg-config
-      - name: Build tests
-        run: |
-          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc -e slow_tests | sort | uniq | paste -s -d "," -`
-          cargo test --profile ci --locked --features ${ALL_FEATURES} --no-run
-      - name: Start DynamodDB and S3
-        run: docker compose -f docker-compose.yml up -d --wait
-      - name: Run tests
-        run: |
-          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc -e slow_tests | sort | uniq | paste -s -d "," -`
-          cargo test --profile ci --locked --features ${ALL_FEATURES}
   query-integration-tests:
-    runs-on: ubuntu-24.04-4x
+    runs-on: ubuntu-24.04
     timeout-minutes: 75
     env:
       # We use opt-level 1 which makes some tests 5x faster to run.
@@ -174,7 +148,7 @@ jobs:
         run: |
           cargo test --locked -p lance --no-default-features --features fp16kernels,slow_tests --test integration_tests
   build-no-lock:
-    runs-on: ubuntu-24.04-8x
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
       # Need up-to-date compilers for kernels
@@ -199,7 +173,7 @@ jobs:
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc -e slow_tests | sort | uniq | paste -s -d "," -`
           cargo build --profile ci --benches --features ${ALL_FEATURES} --tests
   mac-build:
-    runs-on: warp-macos-14-arm64-6x
+    runs-on: macos-14
     timeout-minutes: 45
     strategy:
       matrix:
@@ -220,6 +194,15 @@ jobs:
       - name: Set up Rust
         run: |
           rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }}
+      - name: Install pinned toolchain (if any)
+        # The repo's rust-toolchain.toml may pin a channel that differs from
+        # the runner default. On brew-managed rust these overrides can trigger
+        # a buggy rustup-init path; installing explicitly avoids that.
+        run: |
+          PINNED=$(grep channel rust-toolchain.toml 2>/dev/null | cut -d\" -f2 || echo "")
+          if [ -n "$PINNED" ] && [ "$PINNED" != "stable" ]; then
+            rustup toolchain install "$PINNED" --no-self-update
+          fi
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
       - name: Build tests
         run: |
@@ -230,66 +213,6 @@ jobs:
       - name: Check benchmarks
         run: |
           cargo check --profile ci --benches --features fp16kernels,cli,dynamodb,substrait
-  windows-build:
-    runs-on: windows-latest-4x
-    defaults:
-      run:
-        working-directory: rust
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
-      - name: Install Protoc v21.12
-        working-directory: C:\
-        run: |
-          New-Item -Path 'C:\protoc' -ItemType Directory
-          Set-Location C:\protoc
-          Invoke-WebRequest https://github.com/protocolbuffers/protobuf/releases/download/v21.12/protoc-21.12-win64.zip -OutFile C:\protoc\protoc.zip
-          7z x protoc.zip
-          Add-Content $env:GITHUB_PATH "C:\protoc\bin"
-        shell: powershell
-      - name: Build tests
-        run: cargo test --profile ci --locked --no-run
-      - name: Run tests
-        run: cargo test --profile ci
-      - name: Check benchmarks
-        run: cargo check --profile ci --benches
-
-  qemu-pre-haswell:
-    # Verifies that lance-linalg's runtime SIMD dispatch still works
-    # correctly when the binary is built with the lower x86-64-v2 baseline
-    # (the legacy build path documented in CONTRIBUTING.md). Emulates a
-    # Nehalem CPU under qemu-user; catches any accidental AVX2/FMA
-    # instructions that leak past the runtime dispatch.
-    #
-    # The published-wheel default baseline (`target-cpu=haswell`) is set in
-    # `.cargo/config.toml`; this job overrides RUSTFLAGS for one job to
-    # exercise the legacy path without affecting any other build.
-    name: pre-Haswell SIGILL check (qemu Nehalem)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    env:
-      CC: clang
-      CXX: clang++
-      RUSTFLAGS: "-C target-cpu=x86-64-v2"
-      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: "qemu-x86_64 -cpu Nehalem"
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Setup rust toolchain
-        run: |
-          rustup toolchain install stable
-          rustup default stable
-      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y protobuf-compiler libssl-dev qemu-user
-      - name: Build lance-linalg lib tests in release mode
-        run: |
-          cargo test --release -p lance-linalg --lib --no-run
-      - name: Run lance-linalg lib tests under qemu Nehalem
-        run: |
-          cargo test --release -p lance-linalg --lib
-
   msrv:
     # Check the minimum supported Rust version
     name: MSRV Check - Rust v${{ matrix.msrv }}

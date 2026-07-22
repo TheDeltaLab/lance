@@ -192,6 +192,15 @@ impl AzureBlobStoreProvider {
             builder = builder.with_credentials(credentials);
         }
 
+        #[cfg(feature = "metrics")]
+        {
+            builder = builder.with_http_connector(
+                crate::object_store::metrics::MeteringHttpConnector::new(
+                    self.calculate_object_store_prefix(base_path, Some(&storage_options.0))?,
+                ),
+            );
+        }
+
         Ok(Arc::new(builder.build()?) as Arc<dyn OSObjectStore>)
     }
 
@@ -268,13 +277,6 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
         };
         let throttle_config = AimdThrottleConfig::from_storage_options(params.storage_options())?;
         let inner = if throttle_config.is_disabled() {
-            inner
-        } else if storage_options.client_max_retries() == 0 {
-            log::warn!(
-                "AIMD throttle disabled: the current implementation relies on the object store \
-                 client surfacing retry errors, which requires client_max_retries > 0. \
-                 No throttle or retry layer will be applied."
-            );
             inner
         } else {
             Arc::new(AimdThrottledStore::new(inner, throttle_config)?) as Arc<dyn OSObjectStore>

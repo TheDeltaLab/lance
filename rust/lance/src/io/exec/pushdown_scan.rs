@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashMap;
-use std::{any::Any, sync::Arc};
+use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Int64Type, UInt64Type};
@@ -25,10 +25,10 @@ use datafusion::{
 };
 use datafusion_functions::core::expr_ext::FieldAccessor;
 use datafusion_physical_expr::EquivalenceProperties;
-use futures::{FutureExt, Stream, StreamExt, TryStreamExt};
+use futures::stream::BoxStream;
+use futures::{FutureExt, StreamExt, TryStreamExt};
 use lance_arrow::{RecordBatchExt, SchemaExt};
-use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_in_current_span};
-use lance_core::utils::tracing::FutureTracingExt;
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID_FIELD};
 use lance_file::reader::FileReaderOptions;
 use lance_io::ReadBatchParams;
@@ -159,10 +159,6 @@ impl ExecutionPlan for LancePushdownScanExec {
         "LancePushdownScanExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.output_schema.clone()
     }
@@ -208,21 +204,18 @@ impl ExecutionPlan for LancePushdownScanExec {
             }
         });
 
-        let batch_stream = fragment_stream.map(|(exec, fragment)| {
-            async move {
-                let frag_scanner = FragmentScanner::open(
-                    fragment,
-                    exec.dataset,
-                    exec.projection,
-                    exec.predicate_projection,
-                    exec.predicate,
-                    exec.config.clone(),
-                )
-                .await?;
+        let batch_stream = fragment_stream.map(|(exec, fragment)| async move {
+            let frag_scanner = FragmentScanner::open(
+                fragment,
+                exec.dataset,
+                exec.projection,
+                exec.predicate_projection,
+                exec.predicate,
+                exec.config.clone(),
+            )
+            .await?;
 
-                frag_scanner.scan().await
-            }
-            .future_in_current_span()
+            frag_scanner.scan()
         });
 
         let batch_stream = batch_stream
@@ -329,7 +322,7 @@ impl FragmentScanner {
         })
     }
 
-    pub async fn scan(self) -> Result<impl Stream<Item = Result<RecordBatch>> + 'static + Send> {
+    pub fn scan(self) -> Result<BoxStream<'static, Result<RecordBatch>>> {
         let batch_readahead = self.config.batch_readahead;
         let simplified_predicates = self.simplified_predicates()?;
         let ordered_output = self.config.ordered_output;
@@ -348,14 +341,12 @@ impl FragmentScanner {
             })
             .map(move |(batch_id, predicate)| {
                 let scanner_ref = scanner.clone();
-                spawn_in_current_span(
-                    async move { scanner_ref.read_batch(batch_id, predicate).await },
-                )
-                .map(|res| match res {
-                    Ok(Ok(batch)) => Ok(batch),
-                    Ok(Err(err)) => Err(err),
-                    Err(join_err) => Err(DataFusionError::ExecutionJoin(Box::new(join_err))),
-                })
+                tokio::task::spawn(async move { scanner_ref.read_batch(batch_id, predicate).await })
+                    .map(|res| match res {
+                        Ok(Ok(batch)) => Ok(batch),
+                        Ok(Err(err)) => Err(err),
+                        Err(join_err) => Err(DataFusionError::ExecutionJoin(Box::new(join_err))),
+                    })
             });
 
         let stream = if ordered_output {
@@ -677,7 +668,7 @@ impl FragmentScanner {
                 .collect();
             let schema =
                 Arc::new(ArrowSchema::from(self.predicate_projection.as_ref()).try_into()?);
-            let context = SimplifyContext::default().with_schema(schema);
+            let context = SimplifyContext::builder().with_schema(schema).build();
             let mut simplifier = ExprSimplifier::new(context);
 
             let mut predicates = Vec::with_capacity(num_batches);

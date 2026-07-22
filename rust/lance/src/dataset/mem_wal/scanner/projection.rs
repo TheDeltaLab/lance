@@ -73,12 +73,37 @@ pub fn build_scanner_projection(
     cols
 }
 
+/// Validate user-facing projection names before constructing a canonical schema.
+pub fn validate_projection_names(
+    user_projection: Option<&[String]>,
+    base_schema: &SchemaRef,
+    extra_columns: &[&str],
+) -> Result<()> {
+    let Some(user_projection) = user_projection else {
+        return Ok(());
+    };
+    for name in user_projection {
+        if is_system_column(name)
+            || extra_columns.contains(&name.as_str())
+            || base_schema.field_with_name(name).is_ok()
+        {
+            continue;
+        }
+        return Err(lance_core::Error::invalid_input(format!(
+            "Column '{}' not found in schema",
+            name
+        )));
+    }
+    Ok(())
+}
+
 /// Canonical output schema honoring user column order.
 ///
 /// System cols → nullable `UInt64` at user position (filled by
 /// `project_to_canonical`). `_distance` (when `include_distance`) →
 /// nullable `Float32` at user position, appended if absent. PKs appended.
-/// Unknown names are silently dropped.
+/// Callers should run [`validate_projection_names`] before using this with a
+/// user-supplied projection.
 pub fn canonical_output_schema(
     user_projection: Option<&[String]>,
     base_schema: &SchemaRef,
@@ -122,36 +147,6 @@ pub fn canonical_output_schema(
         })
         .collect();
 
-    Arc::new(Schema::new(fields))
-}
-
-/// Like [`canonical_output_schema`] but with the internal LSM bookkeeping
-/// columns appended: `_memtable_gen` (UInt64, NOT NULL) and `_freshness`
-/// (UInt64, nullable). Used by the vector-search pipeline to carry source
-/// identity + per-source row order through the union and the global
-/// dedup; both columns are dropped by a downstream `project_to_canonical`
-/// before returning to the caller.
-pub fn canonical_internal_schema(
-    user_projection: Option<&[String]>,
-    base_schema: &SchemaRef,
-    pk_columns: &[String],
-    include_distance: bool,
-) -> SchemaRef {
-    use crate::dataset::mem_wal::scanner::exec::{FRESHNESS_COLUMN, MEMTABLE_GEN_COLUMN};
-
-    let canonical =
-        canonical_output_schema(user_projection, base_schema, pk_columns, include_distance);
-    let mut fields: Vec<Arc<Field>> = canonical.fields().iter().cloned().collect();
-    fields.push(Arc::new(Field::new(
-        MEMTABLE_GEN_COLUMN,
-        DataType::UInt64,
-        false,
-    )));
-    fields.push(Arc::new(Field::new(
-        FRESHNESS_COLUMN,
-        DataType::UInt64,
-        true,
-    )));
     Arc::new(Schema::new(fields))
 }
 

@@ -3,7 +3,8 @@
 
 pub mod frag_reuse;
 
-use std::collections::{HashMap, HashSet};
+use lance_core::utils::row_addr_remap::RowAddrRemap;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::Dataset;
@@ -21,6 +22,7 @@ use lance_index::pb::VectorIndexDetails;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_table::format::IndexMetadata;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use super::optimize::{IndexRemapper, IndexRemapperOptions};
 
@@ -46,7 +48,7 @@ impl DatasetIndexRemapper {
     async fn remap_index(
         &self,
         index: &IndexMetadata,
-        mapping: &HashMap<u64, Option<u64>>,
+        mapping: &RowAddrRemap,
     ) -> Result<RemapResult> {
         remap_index(&self.dataset, &index.uuid, mapping).await
     }
@@ -56,7 +58,7 @@ impl DatasetIndexRemapper {
 impl IndexRemapper for DatasetIndexRemapper {
     async fn remap_indices(
         &self,
-        mapping: HashMap<u64, Option<u64>>,
+        mapping: RowAddrRemap,
         affected_fragment_ids: &[u64],
     ) -> Result<Vec<RemappedIndex>> {
         let affected_frag_ids = HashSet::<u64>::from_iter(affected_fragment_ids.iter().copied());
@@ -121,7 +123,7 @@ impl IndexRemapper for DatasetIndexRemapper {
 #[async_trait]
 pub trait LanceIndexStoreExt {
     /// Create an index store for a new index (will always be absolute with no base id)
-    fn from_dataset_for_new(dataset: &Dataset, uuid: &str) -> Result<Self>
+    fn from_dataset_for_new(dataset: &Dataset, uuid: &Uuid) -> Result<Self>
     where
         Self: Sized;
 
@@ -147,8 +149,8 @@ pub(crate) fn dataset_format_version(dataset: &Dataset) -> LanceFileVersion {
 
 #[async_trait]
 impl LanceIndexStoreExt for LanceIndexStore {
-    fn from_dataset_for_new(dataset: &Dataset, uuid: &str) -> Result<Self> {
-        let index_dir = dataset.indices_dir().join(uuid);
+    fn from_dataset_for_new(dataset: &Dataset, uuid: &Uuid) -> Result<Self> {
+        let index_dir = dataset.indices_dir().join(uuid.to_string());
         let cache = dataset.metadata_cache.file_metadata_cache(&index_dir);
         let format_version = dataset_format_version(dataset);
         Ok(Self::with_format_version(
@@ -174,8 +176,6 @@ impl LanceIndexStoreExt for LanceIndexStore {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use super::*;
     use crate::dataset::WriteParams;
     use crate::index::DatasetIndexExt;
@@ -223,7 +223,7 @@ mod tests {
         let built_index = dataset
             .create_index_builder(&["vector"], IndexType::Vector, &params)
             .name("vector_idx".to_string())
-            .index_uuid(first_segment_uuid.to_string())
+            .index_uuid(first_segment_uuid)
             .execute_uncommitted()
             .await
             .unwrap();
@@ -298,7 +298,7 @@ mod tests {
             .create_remapper(&dataset)
             .unwrap();
         let remapped = remapper
-            .remap_indices(HashMap::new(), &[target_fragments[0].id() as u64])
+            .remap_indices(RowAddrRemap::empty(), &[target_fragments[0].id() as u64])
             .await
             .unwrap();
 

@@ -422,25 +422,32 @@ public class ScannerTest {
       TestUtils.SimpleTestDataset testDataset =
           new TestUtils.SimpleTestDataset(allocator, datasetPath);
       testDataset.createEmptyDataset().close();
-      int totalRows = 1000;
-      int batchSize = 100;
-      int batchReadahead = 5;
-      try (Dataset dataset = testDataset.write(1, totalRows)) {
+
+      int totalRows = 2000;
+      int maxRowsPerFile = 100; // ~20 fragments
+      List<FragmentMetadata> fragments = testDataset.createNewFragment(totalRows, maxRowsPerFile);
+      assertTrue(fragments.size() > 1, "expected multiple fragments, got " + fragments.size());
+
+      FragmentOperation.Append append = new FragmentOperation.Append(fragments);
+      try (Dataset dataset = Dataset.commit(allocator, datasetPath, append, Optional.of(1L))) {
+        int batchReadahead = 2; // far below the default (num compute CPUs)
         try (LanceScanner scanner =
             dataset.newScan(
-                new ScanOptions.Builder()
-                    .batchSize(batchSize)
-                    .batchReadahead(batchReadahead)
-                    .build())) {
-          // This test is more about ensuring that the batchReadahead parameter is accepted
-          // and doesn't cause errors. The actual effect of batchReadahead might not be
-          // directly observable in this test.
+                new ScanOptions.Builder().batchSize(50).batchReadahead(batchReadahead).build())) {
           try (ArrowReader reader = scanner.scanBatches()) {
             int rowCount = 0;
+            long idSum = 0;
             while (reader.loadNextBatch()) {
-              rowCount += reader.getVectorSchemaRoot().getRowCount();
+              VectorSchemaRoot root = reader.getVectorSchemaRoot();
+              IntVector ids = (IntVector) root.getVector("id");
+              for (int i = 0; i < root.getRowCount(); i++) {
+                idSum += ids.get(i);
+              }
+              rowCount += root.getRowCount();
             }
             assertEquals(totalRows, rowCount);
+            // ids are the contiguous range [0, totalRows)
+            assertEquals((long) totalRows * (totalRows - 1) / 2, idSum);
           }
         }
       }
@@ -692,6 +699,120 @@ public class ScannerTest {
                   new ScanOptions.Builder().filter("id < 5").fastSearch(true).build())) {
             assertEquals(5, scanner.countRows());
           }
+        }
+      }
+    }
+  }
+
+  @Test
+  void testIncludeDeletedRows(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("include_deleted_rows").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      try (Dataset dataset = testDataset.write(1, 10)) {
+        assertEquals(10, dataset.countRows());
+
+        // Delete rows where id >= 5
+        dataset.delete("id >= 5");
+        assertEquals(5, dataset.countRows());
+
+        // Default scan should exclude deleted rows
+        try (LanceScanner scanner =
+            dataset.newScan(new ScanOptions.Builder().batchSize(20).build())) {
+          assertEquals(5, scanner.countRows(), "default scan: should exclude deleted rows");
+        }
+
+        // includeDeletedRows=true should surface deleted rows
+        // NOTE: includeDeletedRows requires withRowId=true
+        try (LanceScanner scanner =
+            dataset.newScan(
+                new ScanOptions.Builder()
+                    .batchSize(20)
+                    .withRowId(true)
+                    .includeDeletedRows(true)
+                    .build())) {
+          assertEquals(10, scanner.countRows(), "includeDeletedRows: should include deleted rows");
+        }
+      }
+    }
+  }
+
+  @Test
+  void testStrictBatchSize(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("strict_batch_size").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      try (Dataset dataset = testDataset.write(1, 25)) {
+        int batchSize = 10;
+
+        // With strictBatchSize=true, no batch should exceed batchSize
+        try (Scanner scanner =
+            dataset.newScan(
+                new ScanOptions.Builder().batchSize(batchSize).strictBatchSize(true).build())) {
+          try (ArrowReader reader = scanner.scanBatches()) {
+            int totalRows = 0;
+            while (reader.loadNextBatch()) {
+              int rows = reader.getVectorSchemaRoot().getRowCount();
+              assertTrue(rows <= batchSize, "strict: batch " + rows + " should be <= " + batchSize);
+              totalRows += rows;
+            }
+            assertEquals(25, totalRows);
+          }
+        }
+
+        // strictBatchSize=false (default) — batch size may vary
+        try (Scanner scanner =
+            dataset.newScan(new ScanOptions.Builder().batchSize(batchSize).build())) {
+          try (ArrowReader reader = scanner.scanBatches()) {
+            int totalRows = 0;
+            while (reader.loadNextBatch()) {
+              totalRows += reader.getVectorSchemaRoot().getRowCount();
+            }
+            assertEquals(25, totalRows);
+          }
+        }
+      }
+    }
+  }
+
+  @Test
+  void testDisableScoringAutoprojection(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("disable_scoring_autoprojection").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      try (Dataset dataset = testDataset.write(1, 10)) {
+        // Smoke test: verify the option is accepted and scan still works
+        ScanOptions options =
+            new ScanOptions.Builder().batchSize(20).disableScoringAutoprojection(true).build();
+
+        try (LanceScanner scanner = dataset.newScan(options)) {
+          assertEquals(
+              10,
+              scanner.countRows(),
+              "scan with disableScoringAutoprojection should return all rows");
+        }
+
+        // Also verify it doesn't break when combined with other options
+        ScanOptions combinedOptions =
+            new ScanOptions.Builder()
+                .batchSize(20)
+                .filter("id < 5")
+                .disableScoringAutoprojection(true)
+                .includeDeletedRows(false)
+                .strictBatchSize(false)
+                .build();
+
+        try (LanceScanner scanner = dataset.newScan(combinedOptions)) {
+          assertEquals(
+              5,
+              scanner.countRows(),
+              "scan with disableScoringAutoprojection + filter should work");
         }
       }
     }

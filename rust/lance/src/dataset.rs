@@ -8,10 +8,10 @@ use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::DataType;
 use byteorder::{ByteOrder, LittleEndian};
 use chrono::{Duration, prelude::*};
-use deepsize::DeepSizeOf;
 use futures::future::BoxFuture;
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use futures::{FutureExt, Stream};
+use lance_core::deepsize::DeepSizeOf;
 
 use crate::dataset::metadata::UpdateFieldMetadataBuilder;
 use crate::dataset::transaction::translate_schema_metadata_updates;
@@ -24,8 +24,7 @@ use lance_core::datatypes::{OnMissing, OnTypeMismatch, Projectable, Projection};
 use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tracing::{
-    DATASET_CLEANING_EVENT, DATASET_DELETING_EVENT, DATASET_DROPPING_COLUMN_EVENT,
-    TRACE_DATASET_EVENTS,
+    DATASET_DELETING_EVENT, DATASET_DROPPING_COLUMN_EVENT, TRACE_DATASET_EVENTS,
 };
 use lance_datafusion::projection::ProjectionPlan;
 use lance_file::datatypes::populate_schema_dictionary;
@@ -43,7 +42,8 @@ use lance_io::utils::{
 };
 use lance_namespace::LanceNamespace;
 use lance_table::format::{
-    DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest, RowIdMeta, pb,
+    DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, MAGIC, Manifest, RowIdMeta,
+    pb,
 };
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, CommitLock, ManifestLocation, ManifestNamingScheme,
@@ -60,7 +60,7 @@ use roaring::RoaringBitmap;
 use rowids::get_row_id_index;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Debug;
 use std::num::NonZero;
 use std::ops::Range;
@@ -69,19 +69,21 @@ use std::sync::Arc;
 use tracing::{info, instrument};
 
 pub(crate) mod blob;
-mod branch_location;
+pub(crate) mod branch_location;
 pub mod builder;
 pub mod cleanup;
 pub mod delta;
+pub mod files;
 pub mod fragment;
 mod hash_joiner;
 pub mod index;
 pub mod mem_wal;
 mod metadata;
 pub mod optimize;
+pub(crate) mod overlay;
 pub mod progress;
 pub mod refs;
-pub(crate) mod rowids;
+pub mod rowids;
 pub mod scanner;
 mod schema_evolution;
 pub mod sql;
@@ -100,10 +102,11 @@ use self::cleanup::RemovalStats;
 use self::fragment::FileFragment;
 use self::refs::Refs;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
+use self::statistics::DatasetStatistics;
 use self::transaction::{Operation, Transaction, TransactionBuilder, UpdateMapEntry};
-use self::write::write_fragments_internal;
+use self::write::{cleanup_data_fragments, write_fragments_internal};
 use crate::dataset::branch_location::BranchLocation;
-use crate::dataset::cleanup::{CleanupPolicy, CleanupPolicyBuilder};
+use crate::dataset::cleanup::{CleanupOperation, CleanupPolicy, CleanupPolicyBuilder};
 use crate::dataset::refs::{BranchContents, BranchIdentifier, Branches, Tags};
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
@@ -115,7 +118,10 @@ use crate::io::commit::{
 use crate::session::Session;
 use crate::utils::temporal::{SystemTime, timestamp_to_nanos, utc_now};
 use crate::{Error, Result};
-pub use blob::{BlobFile, ReadBlob, ReadBlobsBuilder, ReadBlobsStream};
+pub use blob::{
+    BlobFile, BlobRangeRequest, BlobReadRange, ReadBlob, ReadBlobRange, ReadBlobRangesBuilder,
+    ReadBlobRangesStream, ReadBlobsBuilder, ReadBlobsStream,
+};
 use hash_joiner::HashJoiner;
 pub use lance_core::ROW_ID;
 use lance_core::box_error;
@@ -127,6 +133,7 @@ pub use schema_evolution::{
     BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, UDFCheckpointStore,
 };
 pub use take::TakeBuilder;
+use uuid::Uuid;
 pub use write::merge_insert::{
     MergeInsertBuilder, MergeInsertJob, MergeStats, UncommittedMergeInsert, WhenMatched,
     WhenNotMatched, WhenNotMatchedBySource,
@@ -136,9 +143,9 @@ use crate::dataset::index::LanceIndexStoreExt;
 pub use write::update::{UpdateBuilder, UpdateJob};
 #[allow(deprecated)]
 pub use write::{
-    AutoCleanupParams, CommitBuilder, DeleteBuilder, DeleteResult, ExternalBlobMode, InsertBuilder,
-    UncommittedDelete, WriteDestination, WriteMode, WriteParams, WriteProgressFn, WriteStats,
-    write_fragments,
+    AutoCleanupParams, CommitBuilder, DEFAULT_COMMIT_TIMEOUT, DeleteBuilder, DeleteResult,
+    ExternalBlobMode, InsertBuilder, UncommittedDelete, WriteDestination, WriteMode, WriteParams,
+    WriteProgressFn, WriteStats, write_fragments,
 };
 
 pub(crate) const INDICES_DIR: &str = "_indices";
@@ -224,6 +231,23 @@ impl From<&Manifest> for Version {
             metadata: m.summary().into(),
         }
     }
+}
+
+/// The transaction that produced a version of the dataset, along with the
+/// version's commit timestamp.
+///
+/// Returned by [`Dataset::read_version_transaction`], which reads this
+/// information directly from storage without checking out the version.
+#[derive(Debug, Clone)]
+pub struct VersionTransaction {
+    /// Version number.
+    pub version: u64,
+
+    /// Timestamp the version was committed, in UTC.
+    pub timestamp: DateTime<Utc>,
+
+    /// The transaction that produced this version, if one was recorded.
+    pub transaction: Option<Transaction>,
 }
 
 /// Customize read behavior of a dataset.
@@ -452,6 +476,12 @@ impl Dataset {
         self.refs.tags()
     }
 
+    /// A handle for cheap, index-derived statistics about this dataset (e.g. a
+    /// column's global value range) that never scan data.
+    pub fn statistics(&self) -> DatasetStatistics<'_> {
+        DatasetStatistics::new(self)
+    }
+
     pub fn branches(&self) -> Branches<'_> {
         self.refs.branches()
     }
@@ -499,17 +529,23 @@ impl Dataset {
     ) -> Result<Self> {
         let (source_branch, version_number) = self.resolve_reference(version.into()).await?;
         let branch_location = self.branch_location().find_branch(Some(branch))?;
+        let source_location = self
+            .branch_location()
+            .find_branch(source_branch.as_deref())?;
         let clone_op = Operation::Clone {
             is_shallow: true,
             ref_name: source_branch.clone(),
             ref_version: version_number,
-            ref_path: String::from(self.uri()),
+            ref_path: source_location.uri,
             branch_name: Some(branch.to_string()),
         };
         let transaction = Transaction::new(version_number, clone_op, None);
 
         let builder = CommitBuilder::new(WriteDestination::Uri(branch_location.uri.as_str()))
-            .with_store_params(store_params.unwrap_or_default())
+            // Fall back to the dataset's own store params
+            .with_store_params(
+                store_params.unwrap_or(self.store_params.as_deref().cloned().unwrap_or_default()),
+            )
             .with_object_store(Arc::new(self.object_store.as_ref().clone()))
             .with_commit_handler(self.commit_handler.clone())
             .with_storage_format(self.manifest.data_storage_format.lance_file_version()?);
@@ -555,6 +591,15 @@ impl Dataset {
         version_number: Option<u64>,
         branch: Option<&str>,
     ) -> Result<Self> {
+        // Reject malformed names at the boundary (mirroring the branch CRUD
+        // paths) so they fail as InvalidRef instead of tripping the wrong-chain
+        // check below
+        if let Some(branch_name) = branch
+            && !Branches::is_main_branch(branch)
+        {
+            refs::check_valid_branch(branch_name)?;
+        }
+
         let new_location = self.branch_location().find_branch(branch)?;
 
         let manifest_location = if let Some(version_number) = version_number {
@@ -575,18 +620,33 @@ impl Dataset {
             return Ok(self.clone());
         }
 
-        let manifest = Self::load_manifest(
+        let manifest = Self::get_manifest(
             self.object_store.as_ref(),
             &manifest_location,
             &new_location.uri,
             self.session.as_ref(),
         )
         .await?;
+
+        // The resolved manifest must belong to the requested branch. A mismatch
+        // means the commit handler resolved against a different chain (for
+        // example an external manifest store that ignores branch-qualified
+        // paths); error loudly rather than hand back another branch's data.
+        let requested_branch = branch.and_then(refs::standardize_branch);
+        if manifest.branch.as_deref() != requested_branch.as_deref() {
+            return Err(Error::internal(format!(
+                "checkout of branch '{}' at version {} resolved a manifest belonging to branch '{}'",
+                refs::normalize_branch(branch),
+                manifest.version,
+                refs::normalize_branch(manifest.branch.as_deref()),
+            )));
+        }
+
         Self::checkout_manifest(
             self.object_store.clone(),
             new_location.path,
             new_location.uri,
-            Arc::new(manifest),
+            manifest,
             manifest_location,
             self.session.clone(),
             self.commit_handler.clone(),
@@ -623,6 +683,24 @@ impl Dataset {
                     }
                     _ => Error::io_source(err.into()),
                 })?;
+
+        // A stale cached size yields a bogus footer offset. Detect it (the block
+        // lacks the trailing magic) and retry with the true size, like
+        // read_manifest.
+        if manifest_location.size.is_some() && !last_block.ends_with(MAGIC) {
+            let manifest_location = ManifestLocation {
+                size: None,
+                ..manifest_location.clone()
+            };
+            return Box::pin(Self::load_manifest(
+                object_store,
+                &manifest_location,
+                uri,
+                session,
+            ))
+            .await;
+        }
+
         let offset = read_metadata_offset(&last_block)?;
 
         // If manifest is in the last block, we can decode directly from memory.
@@ -666,6 +744,7 @@ impl Dataset {
             let ds_index_cache = session.index_cache.for_dataset(uri);
             let metadata_key = crate::session::index_caches::IndexMetadataKey {
                 version: manifest_location.version,
+                store_identity: &object_store.store_prefix,
             };
             ds_index_cache
                 .insert_with_key(&metadata_key, Arc::new(indices))
@@ -700,6 +779,35 @@ impl Dataset {
         Ok(manifest)
     }
 
+    /// Fetch the manifest for `manifest_location` from the session metadata
+    /// cache, loading and caching it on a miss.
+    pub(crate) async fn get_manifest(
+        object_store: &ObjectStore,
+        manifest_location: &ManifestLocation,
+        uri: &str,
+        session: &Session,
+    ) -> Result<Arc<Manifest>> {
+        if manifest_location.size.is_none() {
+            return Ok(Arc::new(
+                Self::load_manifest(object_store, manifest_location, uri, session).await?,
+            ));
+        }
+        let metadata_cache = session.metadata_cache.for_dataset(uri);
+        let manifest_key = ManifestKey {
+            version: manifest_location.version,
+            e_tag: manifest_location.e_tag.as_deref(),
+        };
+        if let Some(cached) = metadata_cache.get_with_key(&manifest_key).await {
+            return Ok(cached);
+        }
+        let loaded =
+            Arc::new(Self::load_manifest(object_store, manifest_location, uri, session).await?);
+        metadata_cache
+            .insert_with_key(&manifest_key, loaded.clone())
+            .await;
+        Ok(loaded)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn checkout_manifest(
         object_store: Arc<ObjectStore>,
@@ -725,6 +833,11 @@ impl Dataset {
         let metadata_cache = Arc::new(session.metadata_cache.for_dataset(&uri));
         let index_cache = Arc::new(session.index_cache.for_dataset(&uri));
         let fragment_bitmap = Arc::new(manifest.fragments.iter().map(|f| f.id as u32).collect());
+        write::log_unregistered_base_scoped_options(
+            store_params.as_ref(),
+            &manifest.base_paths,
+            log::Level::Debug,
+        );
         Ok(Self {
             object_store,
             base: base_path,
@@ -778,12 +891,50 @@ impl Dataset {
         batches: impl RecordBatchReader + Send + 'static,
         namespace_client: Arc<dyn LanceNamespace>,
         table_id: Vec<String>,
+        params: Option<WriteParams>,
+    ) -> Result<Self> {
+        Self::write_into_namespace_impl(batches, namespace_client, table_id, None, params).await
+    }
+
+    /// Write into a branch of a namespace client-managed table.
+    ///
+    /// Behaves like [`write_into_namespace`](Self::write_into_namespace), but APPEND and
+    /// OVERWRITE open and commit against `branch` instead of main. CREATE is rejected,
+    /// since a branch forks from an existing version.
+    pub async fn write_into_namespace_on_branch(
+        batches: impl RecordBatchReader + Send + 'static,
+        namespace_client: Arc<dyn LanceNamespace>,
+        table_id: Vec<String>,
+        branch: &str,
+        params: Option<WriteParams>,
+    ) -> Result<Self> {
+        Self::write_into_namespace_impl(
+            batches,
+            namespace_client,
+            table_id,
+            Some(branch.to_string()),
+            params,
+        )
+        .await
+    }
+
+    async fn write_into_namespace_impl(
+        batches: impl RecordBatchReader + Send + 'static,
+        namespace_client: Arc<dyn LanceNamespace>,
+        table_id: Vec<String>,
+        branch: Option<String>,
         mut params: Option<WriteParams>,
     ) -> Result<Self> {
         let mut write_params = params.take().unwrap_or_default();
 
         match write_params.mode {
             WriteMode::Create => {
+                if branch.is_some() {
+                    return Err(Error::not_supported_source(
+                        "cannot create a table on a branch; create on main first, then branch it"
+                            .into(),
+                    ));
+                }
                 let declare_request = DeclareTableRequest {
                     id: Some(table_id.clone()),
                     ..Default::default()
@@ -801,10 +952,13 @@ impl Dataset {
 
                 // Set up commit handler when managed_versioning is enabled
                 if response.managed_versioning == Some(true) {
-                    let external_store = LanceNamespaceExternalManifestStore::new(
+                    // The store derives the branch a request targets from the
+                    // base path it is handed, resolved against the table root.
+                    let external_store = LanceNamespaceExternalManifestStore::for_table_uri(
                         namespace_client.clone(),
                         table_id.clone(),
-                    );
+                        &uri,
+                    )?;
                     let commit_handler: Arc<dyn CommitHandler> =
                         Arc::new(ExternalManifestCommitHandler {
                             external_manifest_store: Arc::new(external_store),
@@ -856,18 +1010,25 @@ impl Dataset {
                     )))
                 })?;
 
-                // Set up commit handler when managed_versioning is enabled
-                if response.managed_versioning == Some(true) {
-                    let external_store = LanceNamespaceExternalManifestStore::new(
-                        namespace_client.clone(),
-                        table_id.clone(),
-                    );
-                    let commit_handler: Arc<dyn CommitHandler> =
-                        Arc::new(ExternalManifestCommitHandler {
+                // Set up commit handler when managed_versioning is enabled.
+                // It must ride on the dataset opened below: InsertBuilder
+                // commits through the destination dataset's handler and does
+                // not consult write params for Dataset destinations.
+                let commit_handler: Option<Arc<dyn CommitHandler>> =
+                    if response.managed_versioning == Some(true) {
+                        // The store derives the branch a request targets from the
+                        // base path it is handed, resolved against the table root.
+                        let external_store = LanceNamespaceExternalManifestStore::for_table_uri(
+                            namespace_client.clone(),
+                            table_id.clone(),
+                            uri.as_str(),
+                        )?;
+                        Some(Arc::new(ExternalManifestCommitHandler {
                             external_manifest_store: Arc::new(external_store),
-                        });
-                    write_params.commit_handler = Some(commit_handler);
-                }
+                        }))
+                    } else {
+                        None
+                    };
 
                 // Set initial credentials and provider from namespace_client
                 if let Some(namespace_storage_options) = response.storage_options {
@@ -905,6 +1066,12 @@ impl Dataset {
                     && let Some(accessor) = &store_params.storage_options_accessor
                 {
                     builder = builder.with_storage_options_accessor(accessor.clone());
+                }
+                if let Some(commit_handler) = commit_handler {
+                    builder = builder.with_commit_handler(commit_handler);
+                }
+                if let Some(branch) = &branch {
+                    builder = builder.with_branch(branch, None);
                 }
                 let dataset = Arc::new(builder.load().await?);
 
@@ -1041,27 +1208,9 @@ impl Dataset {
             return Ok(Some((*transaction).clone()));
         }
 
-        // Prefer inline transaction from manifest when available
-        let transaction = if let Some(pos) = self.manifest.transaction_section {
-            let reader = if let Some(size) = self.manifest_location.size {
-                self.object_store
-                    .open_with_size(&self.manifest_location.path, size as usize)
-                    .await?
-            } else {
-                self.object_store.open(&self.manifest_location.path).await?
-            };
-
-            let tx: pb::Transaction = read_message(reader.as_ref(), pos).await?;
-            Transaction::try_from(tx).map(Some)?
-        } else if let Some(path) = &self.manifest.transaction_file {
-            // Fallback: read external transaction file if present
-            let path = self.transactions_dir().join(path.as_str());
-            let data = self.object_store.inner.get(&path).await?.bytes().await?;
-            let transaction = lance_table::format::pb::Transaction::decode(data)?;
-            Transaction::try_from(transaction).map(Some)?
-        } else {
-            None
-        };
+        let transaction = self
+            .read_transaction_from_storage(&self.manifest, &self.manifest_location)
+            .await?;
 
         if let Some(tx) = transaction.as_ref() {
             self.metadata_cache
@@ -1071,13 +1220,134 @@ impl Dataset {
         Ok(transaction)
     }
 
+    /// Read the transaction recorded by `manifest` directly from storage,
+    /// without consulting or populating any session cache.
+    async fn read_transaction_from_storage(
+        &self,
+        manifest: &Manifest,
+        manifest_location: &ManifestLocation,
+    ) -> Result<Option<Transaction>> {
+        // Prefer inline transaction from manifest when available
+        if let Some(pos) = manifest.transaction_section {
+            let reader = match manifest_location.size {
+                Some(size) => {
+                    self.object_store
+                        .open_with_size(&manifest_location.path, size as usize)
+                        .await?
+                }
+                None => self.object_store.open(&manifest_location.path).await?,
+            };
+
+            // A concurrent overwrite can leave the listed size too small; retry
+            // once with the true size.
+            let tx: pb::Transaction = match read_message(reader.as_ref(), pos).await {
+                Err(e)
+                    if manifest_location.size.is_some()
+                        && e.to_string().contains("file size is too small") =>
+                {
+                    let reader = self.object_store.open(&manifest_location.path).await?;
+                    read_message(reader.as_ref(), pos).await?
+                }
+                other => other?,
+            };
+            Transaction::try_from(tx).map(Some)
+        } else if let Some(path) = &manifest.transaction_file {
+            // Fallback: read external transaction file if present
+            let path = self.transactions_dir().join(path.as_str());
+            let data = self.object_store.inner.get(&path).await?.bytes().await?;
+            let transaction = lance_table::format::pb::Transaction::decode(data)?;
+            Transaction::try_from(transaction).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Read the transaction (if any) and commit timestamp of a version of the
+    /// dataset. `version` is a version number on this dataset's current branch.
+    ///
+    /// Reads the version's manifest transiently: no historical `Dataset` is
+    /// constructed, no `IndexSection` is decoded, and no session cache is read
+    /// or written, so scanning many historical versions does not fill the
+    /// shared caches.
+    ///
+    /// Returns an error if the version does not exist (for example, if it has
+    /// been cleaned up).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn example(dataset: &Dataset) -> Result<()> {
+    /// let record = dataset.read_version_transaction(5).await?;
+    /// let committed_at = record.timestamp;
+    /// let operation = record.transaction.as_ref().map(|t| t.operation.name());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn read_version_transaction(&self, version: u64) -> Result<VersionTransaction> {
+        // Resolve against this dataset's current branch.
+        let manifest_location = self
+            .commit_handler
+            .resolve_version_location(&self.base, version, &self.object_store.inner)
+            .await?;
+
+        // Keep the DatasetNotFound variant callers expect for a missing version.
+        let manifest = read_manifest(
+            &self.object_store,
+            &manifest_location.path,
+            manifest_location.size,
+        )
+        .await
+        .map_err(|e| match &e {
+            Error::NotFound { uri, .. } => Error::dataset_not_found(uri.clone(), box_error(e)),
+            _ => e,
+        })?;
+
+        // The resolved manifest must belong to this dataset's branch. A
+        // mismatch means the commit handler resolved against a different chain
+        // (for example an external manifest store that ignores
+        // branch-qualified paths); error loudly rather than hand back another
+        // branch's transaction.
+        if manifest.branch != self.manifest.branch {
+            return Err(Error::internal(format!(
+                "reading version {} on branch '{}' resolved a manifest belonging to branch '{}'",
+                version,
+                refs::normalize_branch(self.manifest.branch.as_deref()),
+                refs::normalize_branch(manifest.branch.as_deref()),
+            )));
+        }
+
+        let transaction = self
+            .read_transaction_from_storage(&manifest, &manifest_location)
+            .await?;
+
+        Ok(VersionTransaction {
+            version: manifest.version,
+            timestamp: manifest.timestamp(),
+            transaction,
+        })
+    }
+
     /// Read the transaction file for this version of the dataset.
     ///
     /// If there was no transaction file written for this version of the dataset
     /// then this will return None.
+    ///
+    /// Does not populate the session caches; see
+    /// [`Self::read_version_transaction`].
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn example(dataset: &Dataset) -> Result<()> {
+    /// let transaction = dataset.read_transaction_by_version(5).await?;
+    /// let operation = transaction.as_ref().map(|t| t.operation.name());
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn read_transaction_by_version(&self, version: u64) -> Result<Option<Transaction>> {
-        let dataset_version = self.checkout_version(version).await?;
-        dataset_version.read_transaction().await
+        Ok(self.read_version_transaction(version).await?.transaction)
     }
 
     /// List transactions for the dataset, up to a maximum number.
@@ -1200,8 +1470,15 @@ impl Dataset {
         &self,
         policy: CleanupPolicy,
     ) -> BoxFuture<'_, Result<RemovalStats>> {
-        info!(target: TRACE_DATASET_EVENTS, event=DATASET_CLEANING_EVENT, uri=&self.uri);
-        cleanup::cleanup_old_versions(self, policy).boxed()
+        async move { self.cleanup(policy).execute().await }.boxed()
+    }
+
+    /// Creates a cleanup operation for this dataset.
+    ///
+    /// The returned operation can be explained without deleting files, or
+    /// executed to re-evaluate the current dataset state and remove files.
+    pub fn cleanup(&self, policy: CleanupPolicy) -> CleanupOperation<'_> {
+        CleanupOperation::new(self, policy)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1523,6 +1800,36 @@ impl Dataset {
         ))
     }
 
+    /// Create a planned reader for row-specific blob-local byte ranges.
+    ///
+    /// Each [`BlobRangeRequest`] contains both its row selector and byte range,
+    /// so requests can be repeated or reordered without coordinating parallel
+    /// selector and range lists.
+    ///
+    /// ```rust
+    /// # use std::sync::Arc;
+    /// # use lance::dataset::{BlobRangeRequest, Dataset};
+    /// # use lance::Result;
+    /// # async fn example(dataset: Arc<Dataset>) -> Result<()> {
+    /// let ranges = dataset
+    ///     .read_blob_ranges("images")?
+    ///     .with_row_indices([
+    ///         BlobRangeRequest::new(7, 0, 1024),
+    ///         BlobRangeRequest::new(7, 4096, 1024),
+    ///     ])
+    ///     .execute()
+    ///     .await?;
+    /// # let _ = ranges;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn read_blob_ranges(
+        self: &Arc<Self>,
+        column: impl AsRef<str>,
+    ) -> Result<ReadBlobRangesBuilder> {
+        Ok(ReadBlobRangesBuilder::new(self.read_blobs(column)?))
+    }
+
     /// Get a stream of batches based on iterator of ranges of row numbers.
     ///
     /// This is an experimental API. It may change at any time.
@@ -1564,26 +1871,7 @@ impl Dataset {
                     ));
                 }
 
-                let selected_fragment_ids = fragment_ids.iter().copied().collect::<BTreeSet<_>>();
-                let selected_fragments = self
-                    .get_fragments()
-                    .into_iter()
-                    .filter(|fragment| selected_fragment_ids.contains(&(fragment.id() as u32)))
-                    .collect::<Vec<_>>();
-
-                if selected_fragments.len() != selected_fragment_ids.len() {
-                    let present_fragment_ids = selected_fragments
-                        .iter()
-                        .map(|fragment| fragment.id() as u32)
-                        .collect::<HashSet<_>>();
-                    let missing_fragment_ids = selected_fragment_ids
-                        .into_iter()
-                        .filter(|fragment_id| !present_fragment_ids.contains(fragment_id))
-                        .collect::<Vec<_>>();
-                    return Err(Error::invalid_input(format!(
-                        "Dataset::sample received fragment ids that are not part of the current dataset version: {missing_fragment_ids:?}",
-                    )));
-                }
+                let selected_fragments = self.get_fragments_from_ids(fragment_ids)?;
 
                 let num_rows = stream::iter(selected_fragments.iter().cloned())
                     .map(|fragment| async move { fragment.count_rows(None).await })
@@ -1744,21 +2032,26 @@ impl Dataset {
         store_params
     }
 
-    fn store_params_for_base(
+    pub(crate) fn store_params_for_base(
         &self,
         base_path: Option<&lance_table::format::BasePath>,
     ) -> ObjectStoreParams {
         // Base-specific bindings are exact ObjectStoreParams keyed by
-        // `BasePath.path`. If a base has no explicit binding then reads fall back
-        // to the dataset-level default store params.
-        base_path
-            .and_then(|base_path| {
-                self.base_store_params
-                    .as_ref()
-                    .and_then(|params| params.get(&base_path.path))
-            })
-            .cloned()
-            .unwrap_or_else(|| self.store_params.as_deref().cloned().unwrap_or_default())
+        // `BasePath.path` and are used as-is. Otherwise the dataset-level
+        // default params are resolved for the base scope: `base_<id>.<key>`
+        // storage options overlay the shared defaults for that base.
+        if let Some(params) = base_path.and_then(|base_path| {
+            self.base_store_params
+                .as_ref()
+                .and_then(|params| params.get(&base_path.path))
+        }) {
+            return params.clone();
+        }
+        let default_params = self.store_params.as_deref().cloned().unwrap_or_default();
+        match default_params.scoped_to_base(base_path.map(|base_path| base_path.id)) {
+            Cow::Owned(scoped_params) => scoped_params,
+            Cow::Borrowed(_) => default_params,
+        }
     }
 
     /// Returns the initial storage options used when opening this dataset, if any.
@@ -1882,58 +2175,215 @@ impl Dataset {
             file_metadata.minor_version as u32,
         )?;
 
-        // Get top-level column names from file schema in file order
-        let column_names: Vec<&str> = file_metadata
-            .file_schema
-            .fields
-            .iter()
-            .map(|f| f.name.as_str())
-            .collect();
-
-        // Project dataset schema by file column names to get dataset field IDs
-        let projected_ds_schema = self.schema().project(&column_names)?;
-
-        // Walk both schemas in parallel to build fields and column_indices
         let is_structural = file_version >= LanceFileVersion::V2_1;
-        let ds_fields: Vec<_> = projected_ds_schema.fields_pre_order().collect();
-        let file_fields: Vec<_> = file_metadata.file_schema.fields_pre_order().collect();
+        let physical_columns = file_metadata.column_metadatas.len();
+        let has_footer_orphans = file_metadata.file_schema.fields.len() > physical_columns;
+        let dataset_schema = self.schema();
+        let mut represented_columns = 0usize;
+        let mut column_names = Vec::new();
+        let mut consumed_top_level_fields = 0usize;
 
-        if ds_fields.len() != file_fields.len() {
+        fn physical_column_count(
+            field: &lance_core::datatypes::Field,
+            is_structural: bool,
+        ) -> usize {
+            if !is_structural {
+                return 1 + field
+                    .children
+                    .iter()
+                    .map(|child| physical_column_count(child, is_structural))
+                    .sum::<usize>();
+            }
+
+            if field.children.is_empty() || field.is_blob() || field.is_packed_struct() {
+                1
+            } else {
+                field
+                    .children
+                    .iter()
+                    .map(|child| physical_column_count(child, is_structural))
+                    .sum()
+            }
+        }
+
+        fn field_contains_blob(field: &lance_core::datatypes::Field) -> bool {
+            field.is_blob() || field.children.iter().any(field_contains_blob)
+        }
+
+        fn field_names_match(
+            fields: &[lance_core::datatypes::Field],
+            start: usize,
+            names: &[&str],
+        ) -> bool {
+            fields
+                .get(start..start + names.len())
+                .is_some_and(|candidate| {
+                    candidate
+                        .iter()
+                        .zip(names)
+                        .all(|(field, name)| field.name == *name)
+                })
+        }
+
+        fn blob_descriptor_orphan_len(
+            fields: &[lance_core::datatypes::Field],
+            start: usize,
+        ) -> usize {
+            const BLOB_V2_DESCRIPTOR_FIELDS: &[&str] =
+                &["kind", "position", "size", "blob_id", "blob_uri"];
+            const BLOB_V1_DESCRIPTOR_FIELDS: &[&str] = &["position", "size"];
+
+            if field_names_match(fields, start, BLOB_V2_DESCRIPTOR_FIELDS) {
+                BLOB_V2_DESCRIPTOR_FIELDS.len()
+            } else if field_names_match(fields, start, BLOB_V1_DESCRIPTOR_FIELDS) {
+                BLOB_V1_DESCRIPTOR_FIELDS.len()
+            } else {
+                0
+            }
+        }
+
+        fn collect_columns(
+            field: &lance_core::datatypes::Field,
+            is_structural: bool,
+            fields: &mut Vec<i32>,
+            column_indices: &mut Vec<i32>,
+            curr_column_idx: &mut i32,
+        ) {
+            let contributes = !is_structural
+                || field.children.is_empty()
+                || field.is_blob()
+                || field.is_packed_struct();
+            let recurse = !is_structural || (!field.is_blob() && !field.is_packed_struct());
+
+            if contributes {
+                fields.push(field.id);
+                column_indices.push(*curr_column_idx);
+                *curr_column_idx += 1;
+            }
+
+            if recurse {
+                for child in &field.children {
+                    collect_columns(
+                        child,
+                        is_structural,
+                        fields,
+                        column_indices,
+                        curr_column_idx,
+                    );
+                }
+            }
+        }
+
+        fn validate_file_field_matches_dataset(
+            dataset_field: &lance_core::datatypes::Field,
+            file_field: &lance_core::datatypes::Field,
+            path: &str,
+        ) -> Result<()> {
+            if dataset_field.name != file_field.name {
+                return Err(Error::invalid_input(format!(
+                    "Schema mismatch: expected field '{}' but file has '{}'",
+                    path, file_field.name
+                )));
+            }
+
+            if dataset_field.is_blob() && file_field.is_blob() {
+                return Ok(());
+            }
+
+            if dataset_field.children.len() != file_field.children.len() {
+                return Err(Error::invalid_input(format!(
+                    "Schema mismatch: field '{}' has {} children in dataset schema but {} children in file schema",
+                    path,
+                    dataset_field.children.len(),
+                    file_field.children.len()
+                )));
+            }
+
+            for (dataset_child, file_child) in
+                dataset_field.children.iter().zip(&file_field.children)
+            {
+                let child_path = format!("{}.{}", path, dataset_child.name);
+                validate_file_field_matches_dataset(dataset_child, file_child, &child_path)?;
+            }
+
+            Ok(())
+        }
+
+        let file_schema_fields = &file_metadata.file_schema.fields;
+        let mut idx = 0usize;
+        while represented_columns < physical_columns {
+            let Some(field) = file_schema_fields.get(idx) else {
+                return Err(Error::invalid_input(format!(
+                    "Schema mismatch: file schema ended after representing {} physical columns but file has {} columns",
+                    represented_columns, physical_columns
+                )));
+            };
+
+            let Some(dataset_field) = dataset_schema.field(&field.name) else {
+                return Err(Error::invalid_input(format!(
+                    "Schema mismatch: file has extra field '{}'",
+                    field.name
+                )));
+            };
+            validate_file_field_matches_dataset(dataset_field, field, &field.name)?;
+
+            represented_columns += physical_column_count(field, is_structural);
+            column_names.push(field.name.as_str());
+            consumed_top_level_fields = idx + 1;
+            idx += 1;
+
+            if has_footer_orphans && field_contains_blob(field) {
+                loop {
+                    let skipped = blob_descriptor_orphan_len(file_schema_fields, idx);
+                    if skipped == 0 {
+                        break;
+                    }
+                    consumed_top_level_fields = idx + skipped;
+                    idx += skipped;
+                }
+            }
+        }
+
+        if represented_columns != physical_columns {
             return Err(Error::invalid_input(format!(
-                "Schema mismatch: dataset projection has {} fields but file has {} fields",
-                ds_fields.len(),
-                file_fields.len()
+                "Schema mismatch: file schema represents {} physical columns but file has {} columns",
+                represented_columns, physical_columns
             )));
         }
+
+        if let Some(field) = file_schema_fields.get(consumed_top_level_fields) {
+            return Err(Error::invalid_input(format!(
+                "Schema mismatch: file has extra field '{}'",
+                field.name
+            )));
+        }
+
+        let projected_ds_schema = self.schema().project(&column_names)?;
 
         let mut fields = Vec::new();
         let mut column_indices = Vec::new();
         let mut curr_column_idx: i32 = 0;
-        let mut packed_struct_fields_num: usize = 0;
+        for field in &projected_ds_schema.fields {
+            collect_columns(
+                field,
+                is_structural,
+                &mut fields,
+                &mut column_indices,
+                &mut curr_column_idx,
+            );
+        }
 
-        for (ds_field, file_field) in ds_fields.iter().zip(file_fields.iter()) {
-            if ds_field.name != file_field.name {
-                return Err(Error::invalid_input(format!(
-                    "Schema mismatch: expected field '{}' but file has '{}'",
-                    ds_field.name, file_field.name
-                )));
-            }
+        if curr_column_idx as usize != physical_columns {
+            return Err(Error::invalid_input(format!(
+                "Schema mismatch: dataset projection maps to {} physical columns but file has {} columns",
+                curr_column_idx, physical_columns
+            )));
+        }
 
-            if packed_struct_fields_num > 0 {
-                packed_struct_fields_num -= 1;
-                continue;
-            }
-
-            if file_field.is_packed_struct() {
-                fields.push(ds_field.id);
-                column_indices.push(curr_column_idx);
-                curr_column_idx += 1;
-                packed_struct_fields_num = file_field.children.len();
-            } else if file_field.children.is_empty() || !is_structural {
-                fields.push(ds_field.id);
-                column_indices.push(curr_column_idx);
-                curr_column_idx += 1;
-            }
+        if fields.is_empty() && physical_columns > 0 {
+            return Err(Error::invalid_input(
+                "Schema mismatch: file has columns but none matched the dataset schema",
+            ));
         }
 
         let file_size_nz = NonZero::new(file_size);
@@ -1951,7 +2401,7 @@ impl Dataset {
     /// Resolve the data directory for a given base_id.
     ///
     /// If `base_id` is `None`, returns the default data directory.
-    fn data_file_dir_for_base(&self, base_id: Option<u32>) -> Result<Path> {
+    pub(crate) fn data_file_dir_for_base(&self, base_id: Option<u32>) -> Result<Path> {
         match base_id {
             Some(base_id) => {
                 let base_path = self.manifest.base_paths.get(&base_id).ok_or_else(|| {
@@ -1993,6 +2443,13 @@ impl Dataset {
             Some(base_id) => self.base_object_store(base_id).await,
             None => Ok(self.object_store.clone()),
         }
+    }
+
+    /// The `ObjectStoreParams` this dataset was opened with, or `None` when
+    /// opened without explicit params. Lets a caller re-open a derived path
+    /// (e.g. a MemWAL flushed generation) with the same store this dataset used.
+    pub fn store_params(&self) -> Option<&ObjectStoreParams> {
+        self.store_params.as_deref()
     }
 
     pub(crate) async fn object_store_for_data_file(
@@ -2149,6 +2606,39 @@ impl Dataset {
             .version)
     }
 
+    /// Return whether the dataset has a newer committed version.
+    pub async fn is_stale(&self) -> Result<bool> {
+        let latest_version = self.latest_version_id().await?;
+        Ok(latest_version != self.manifest.version)
+    }
+
+    /// Return whether the immediate attached successor manifest exists.
+    ///
+    /// This is a fast contiguous-history probe. It does not resolve the latest
+    /// version and may return `false` if intermediate manifests have been
+    /// removed. Callers that need a general freshness check should use
+    /// [`Self::is_stale`].
+    #[doc(hidden)]
+    pub async fn has_successor_version(&self) -> Result<bool> {
+        let Some(next_version) = self.manifest.version.checked_add(1) else {
+            return Ok(false);
+        };
+        if lance_table::format::is_detached_version(next_version) {
+            return Ok(false);
+        }
+
+        let exists = self
+            .commit_handler
+            .version_exists(
+                &self.base,
+                next_version,
+                self.object_store.inner.as_ref(),
+                self.manifest_location.naming_scheme,
+            )
+            .await?;
+        Ok(exists)
+    }
+
     pub fn count_fragments(&self) -> usize {
         self.manifest.fragments.len()
     }
@@ -2198,37 +2688,108 @@ impl Dataset {
         &self.manifest.fragments
     }
 
-    // Gets a filtered list of fragments from ids in O(N) time instead of using
-    // `get_fragment` which would require O(N^2) time.
-    pub fn get_frags_from_ordered_ids(&self, ordered_ids: &[u32]) -> Vec<Option<FileFragment>> {
-        let mut fragments = Vec::with_capacity(ordered_ids.len());
-        let mut id_iter = ordered_ids.iter();
-        let mut id = id_iter.next();
-        // This field is just used to assert the ids are in order
-        let mut last_id: i64 = -1;
-        for frag in self.manifest.fragments.iter() {
-            let mut the_id = if let Some(id) = id { *id } else { break };
-            // Assert the given ids are, in fact, in order
-            assert!(the_id as i64 > last_id);
-            // For any IDs we've passed we can assume that no fragment exists any longer
-            // with that ID.
-            while the_id < frag.id as u32 {
-                fragments.push(None);
-                last_id = the_id as i64;
-                id = id_iter.next();
-                the_id = if let Some(id) = id { *id } else { break };
-            }
+    pub(crate) fn normalize_fragment_ids(fragment_ids: &[u32]) -> Vec<u32> {
+        let mut ids = fragment_ids.to_vec();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
 
-            if the_id == frag.id as u32 {
-                fragments.push(Some(FileFragment::new(
-                    Arc::new(self.clone()),
-                    frag.clone(),
-                )));
-                last_id = the_id as i64;
-                id = id_iter.next();
-            }
+    pub(crate) fn get_fragments_from_ids(&self, fragment_ids: &[u32]) -> Result<Vec<FileFragment>> {
+        let ordered_ids = Self::normalize_fragment_ids(fragment_ids);
+        let fragments = self.get_frags_from_ordered_ids(&ordered_ids);
+        if let Some(missing_id) = fragments
+            .iter()
+            .zip(ordered_ids.iter())
+            .find_map(|(fragment, fragment_id)| fragment.is_none().then_some(*fragment_id))
+        {
+            return Err(Error::invalid_input(format!(
+                "Unknown fragment id {missing_id} in fragment filter; not part of the current dataset version"
+            )));
         }
-        fragments
+
+        Ok(fragments.into_iter().flatten().collect())
+    }
+
+    pub(crate) fn get_existing_fragments_from_ids(
+        &self,
+        fragment_ids: &[u32],
+    ) -> Vec<FileFragment> {
+        let ordered_ids = Self::normalize_fragment_ids(fragment_ids);
+        self.get_frags_from_ordered_ids(&ordered_ids)
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    pub(crate) fn get_fragment_metadata_from_ids(
+        &self,
+        fragment_ids: &[u32],
+    ) -> Result<Vec<Fragment>> {
+        Ok(self
+            .get_fragments_from_ids(fragment_ids)?
+            .into_iter()
+            .map(|fragment| fragment.metadata().clone())
+            .collect())
+    }
+
+    pub(crate) fn get_existing_fragment_metadata_from_ids(
+        &self,
+        fragment_ids: &[u32],
+    ) -> Vec<Fragment> {
+        self.get_existing_fragments_from_ids(fragment_ids)
+            .into_iter()
+            .map(|fragment| fragment.metadata().clone())
+            .collect()
+    }
+
+    pub(crate) async fn count_rows_in_fragments(&self, fragment_ids: &[u32]) -> Result<usize> {
+        let fragments = self.get_fragments_from_ids(fragment_ids)?;
+        self.count_rows_in_resolved_fragments(fragments).await
+    }
+
+    pub(crate) async fn count_rows_in_existing_fragments(
+        &self,
+        fragment_ids: &[u32],
+    ) -> Result<usize> {
+        let fragments = self.get_existing_fragments_from_ids(fragment_ids);
+        self.count_rows_in_resolved_fragments(fragments).await
+    }
+
+    async fn count_rows_in_resolved_fragments(
+        &self,
+        fragments: Vec<FileFragment>,
+    ) -> Result<usize> {
+        let counts = stream::iter(fragments)
+            .map(|fragment| async move { fragment.count_rows(None).await })
+            .buffer_unordered(16)
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok(counts.iter().sum())
+    }
+
+    /// Resolves fragments for the given ids without scanning the manifest.
+    ///
+    /// The ids do not need to be sorted or deduplicated. Each id is resolved
+    /// independently via the fragment bitmap.
+    pub fn get_frags_from_ordered_ids(&self, ordered_ids: &[u32]) -> Vec<Option<FileFragment>> {
+        let dataset = Arc::new(self.clone());
+        ordered_ids
+            .iter()
+            .map(|id| {
+                if !self.fragment_bitmap.contains(*id) {
+                    return None;
+                }
+                let fragment_index = self.fragment_bitmap.rank(*id) as usize - 1;
+                let fragment = self.manifest.fragments.get(fragment_index)?;
+                debug_assert_eq!(
+                    fragment.id, *id as u64,
+                    "fragment_bitmap rank({id}) resolved to fragment {}, but fragment_bitmap and manifest.fragments are expected to stay in sync",
+                    fragment.id
+                );
+                Some(FileFragment::new(dataset.clone(), fragment.clone()))
+            })
+            .collect()
     }
 
     // This method filters deleted items from `addr_or_ids` using `addrs` as a reference
@@ -2432,7 +2993,7 @@ impl Dataset {
                     self.manifest_location.path.clone(),
                     format!(
                         "Duplicate index id {} found in dataset {:?}",
-                        &index.uuid, self.base
+                        index.uuid, self.base
                     ),
                 ));
             }
@@ -2509,11 +3070,12 @@ impl Dataset {
         store_params: Option<ObjectStoreParams>,
     ) -> Result<Self> {
         let (ref_name, version_number) = self.resolve_reference(version.into()).await?;
+        let source_location = self.branch_location().find_branch(ref_name.as_deref())?;
         let clone_op = Operation::Clone {
             is_shallow: true,
             ref_name,
             ref_version: version_number,
-            ref_path: self.uri.clone(),
+            ref_path: source_location.uri,
             branch_name: None,
         };
         let transaction = Transaction::new(version_number, clone_op, None);
@@ -2778,30 +3340,13 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
         .map_ok(move |location| {
             let latest_tx = latest_tx.take();
             async move {
-                let manifest_key = ManifestKey {
-                    version: location.version,
-                    e_tag: location.e_tag.as_deref(),
-                };
-                let manifest = if let Some(cached) =
-                    dataset.metadata_cache.get_with_key(&manifest_key).await
-                {
-                    cached
-                } else {
-                    let loaded = Arc::new(
-                        Dataset::load_manifest(
-                            dataset.object_store.as_ref(),
-                            &location,
-                            &dataset.uri,
-                            dataset.session.as_ref(),
-                        )
-                        .await?,
-                    );
-                    dataset
-                        .metadata_cache
-                        .insert_with_key(&manifest_key, loaded.clone())
-                        .await;
-                    loaded
-                };
+                let manifest = Dataset::get_manifest(
+                    dataset.object_store.as_ref(),
+                    &location,
+                    &dataset.uri,
+                    dataset.session.as_ref(),
+                )
+                .await?;
 
                 if let Some(latest_tx) = latest_tx {
                     // We ignore the error, since we don't care if the receiver is dropped.
@@ -3033,13 +3578,13 @@ impl Dataset {
     /// progress via the supplied callback.
     pub async fn merge_index_metadata(
         &self,
-        index_uuid: &str,
+        index_uuid: &Uuid,
         index_type: IndexType,
-        batch_readhead: Option<usize>,
+        _batch_readhead: Option<usize>,
         progress: Arc<dyn IndexBuildProgress>,
     ) -> Result<()> {
         let store = LanceIndexStore::from_dataset_for_new(self, index_uuid)?;
-        let index_dir = self.indices_dir().join(index_uuid);
+        let index_dir = self.indices_dir().join(index_uuid.to_string());
         match index_type {
             IndexType::Inverted => {
                 // Call merge_index_files function for inverted index
@@ -3052,24 +3597,21 @@ impl Dataset {
                 .await
             }
             IndexType::BTree => {
-                // Call merge_index_files function for btree index
-                lance_index::scalar::btree::merge_index_files(
-                    self.object_store.as_ref(),
-                    &index_dir,
-                    Arc::new(store),
-                    batch_readhead,
-                    progress,
-                )
-                .await
+                Err(Error::invalid_input(
+                    "BTree distributed indexing no longer supports merge_index_metadata; \
+                     build segments, optionally merge groups with merge_existing_index_segments(...), \
+                     and commit with commit_existing_index_segments(...)"
+                        .to_string(),
+                ))
             }
             IndexType::Bitmap => {
-                lance_index::scalar::bitmap::merge_index_files(
-                    self.object_store.as_ref(),
-                    &index_dir,
-                    Arc::new(store),
-                    progress,
-                )
-                .await
+                Err(Error::invalid_input(
+                    "Bitmap distributed indexing no longer supports merge_index_metadata; \
+                     build segments with create_index_uncommitted(...), merge them with \
+                     merge_existing_index_segments(...), and commit with \
+                     commit_existing_index_segments(...)"
+                        .to_string(),
+                ))
             }
             IndexType::IvfFlat | IndexType::IvfPq | IndexType::IvfSq | IndexType::Vector => {
                 Err(Error::invalid_input(

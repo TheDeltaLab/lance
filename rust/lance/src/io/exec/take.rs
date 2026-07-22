@@ -4,6 +4,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 
 use arrow::array::AsArray;
 use arrow::compute::{TakeOptions, concat_batches};
@@ -27,13 +28,11 @@ use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::{Field, OnMissing, Projection};
 use lance_core::error::{DataFusionResult, LanceOptionExt};
 use lance_core::utils::address::RowAddress;
-use lance_core::utils::{
-    tokio::{get_num_compute_intensive_cpus, spawn_in_current_span},
-    tracing::{FutureTracingExt, PHASE_LOAD_DATA_TAKE, StreamTracingExt},
-};
+use lance_core::utils::futures::FinallyStreamExt;
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ID};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
-use tracing::{error, info_span};
+use tracing::error;
 
 use crate::dataset::Dataset;
 use crate::dataset::fragment::{FragReadConfig, FragmentReader};
@@ -71,6 +70,10 @@ struct TakeStream {
     dataset: Arc<Dataset>,
     /// The fields to take from the input stream
     fields_to_take: Arc<Schema>,
+    /// The descriptor-view schema used for storage reads when blob payloads
+    /// must be materialized after take.
+    read_fields: Arc<Schema>,
+    materialize_blob_v2_binary: bool,
     /// The output schema, needed for us to merge the new columns
     /// into the input data in the correct order
     output_schema: SchemaRef,
@@ -93,9 +96,20 @@ impl TakeStream {
         metrics: &ExecutionPlanMetricsSet,
         partition: usize,
     ) -> Self {
+        let materialize_blob_v2_binary =
+            crate::dataset::blob::schema_has_blob_v2_binary_view(fields_to_take.as_ref());
+        let read_fields = if materialize_blob_v2_binary {
+            Arc::new(crate::dataset::blob::blob_v2_descriptor_schema(
+                fields_to_take.as_ref(),
+            ))
+        } else {
+            fields_to_take.clone()
+        };
         Self {
             dataset,
             fields_to_take,
+            read_fields,
+            materialize_blob_v2_binary,
             output_schema,
             readers_cache: Arc::new(Mutex::new(HashMap::new())),
             scan_scheduler,
@@ -132,14 +146,12 @@ impl TakeStream {
                 ))
             })?;
 
-        let reader = Arc::new(
-            fragment
-                .open(
-                    &self.fields_to_take,
-                    FragReadConfig::default().with_scan_scheduler(self.scan_scheduler.clone()),
-                )
-                .await?,
-        );
+        let mut read_config =
+            FragReadConfig::default().with_scan_scheduler(self.scan_scheduler.clone());
+        if self.materialize_blob_v2_binary {
+            read_config = read_config.with_row_address(true);
+        }
+        let reader = Arc::new(fragment.open(&self.read_fields, read_config).await?);
 
         let mut readers = self.readers_cache.lock().unwrap();
         readers.insert(fragment_id, reader.clone());
@@ -292,7 +304,7 @@ impl TakeStream {
                     let offsets = std::mem::take(&mut current_offsets);
                     futures.push_back(
                         async move { reader.take_as_batch(&offsets, Some(batch_number)).await }
-                            .boxed_in_current_span(),
+                            .boxed(),
                     );
                 }
                 current_fragment_id = Some(addr.fragment_id());
@@ -310,7 +322,7 @@ impl TakeStream {
                         .take_as_batch(&current_offsets, Some(batch_number))
                         .await
                 }
-                .boxed_in_current_span(),
+                .boxed(),
             );
         }
 
@@ -356,10 +368,15 @@ impl TakeStream {
             (None, None) => {}
         }
 
-        self.metrics
-            .baseline_metrics
-            .record_output(new_data.num_rows());
-        self.metrics.batches_processed.add(1);
+        if self.materialize_blob_v2_binary {
+            new_data = crate::dataset::blob::materialize_blob_v2_binary_batch(
+                &self.dataset,
+                self.fields_to_take.as_ref(),
+                new_data,
+            )
+            .await?;
+        }
+
         Ok(batch.merge_with_schema(&new_data, self.output_schema.as_ref())?)
     }
 
@@ -367,23 +384,40 @@ impl TakeStream {
         self: Arc<Self>,
         input: S,
     ) -> impl Stream<Item = Result<RecordBatch>> {
-        let scan_scheduler = self.scan_scheduler.clone();
-        let metrics = self.metrics.clone();
+        let result_scan_scheduler = self.scan_scheduler.clone();
+        let final_scan_scheduler = self.scan_scheduler.clone();
+        let result_metrics = self.metrics.clone();
+        let final_metrics = self.metrics.clone();
         let batches = input
             .enumerate()
             .map(move |(batch_index, batch)| {
                 let batch = batch?;
                 let this = self.clone();
                 Ok(
-                    spawn_in_current_span(this.map_batch(batch, batch_index as u32))
+                    tokio::task::spawn(this.map_batch(batch, batch_index as u32))
                         .map(|res| res.unwrap()),
                 )
             })
-            .boxed_stream_in_current_span();
+            .boxed();
         batches
-            .inspect_ok(move |_| metrics.io_metrics.record(&scan_scheduler))
             .try_buffered(get_num_compute_intensive_cpus())
-            .stream_in_current_span()
+            .map(move |result| {
+                if result.is_ok() {
+                    result_metrics.batches_processed.add(1);
+                }
+                result_metrics.io_metrics.record(&result_scan_scheduler);
+                match result_metrics
+                    .baseline_metrics
+                    .record_poll(Poll::Ready(Some(result)))
+                {
+                    Poll::Ready(Some(result)) => result,
+                    _ => unreachable!("record_poll returned a different poll state"),
+                }
+            })
+            .finally(move || {
+                final_metrics.baseline_metrics.done();
+                final_metrics.io_metrics.record(&final_scan_scheduler);
+            })
     }
 }
 
@@ -475,10 +509,10 @@ impl TakeExec {
             projection
         );
 
-        let output_schema = Arc::new(Self::calculate_output_schema(
-            dataset.schema(),
-            &input.schema(),
-            &projection,
+        let output_schema =
+            Self::calculate_output_schema(dataset.schema(), &input.schema(), &projection);
+        let output_schema = Arc::new(crate::dataset::blob::public_blob_v2_binary_output_schema(
+            &output_schema,
         ));
         let output_arrow = Arc::new(ArrowSchema::from(output_schema.as_ref()));
         let properties = Arc::new(
@@ -509,7 +543,7 @@ impl TakeExec {
     ///
     /// If this happens the order of the new nested fields will match the order defined in
     /// the dataset schema.
-    fn calculate_output_schema(
+    pub(crate) fn calculate_output_schema(
         dataset_schema: &Schema,
         input_schema: &ArrowSchema,
         projection: &Projection,
@@ -562,10 +596,6 @@ impl TakeExec {
 impl ExecutionPlan for TakeExec {
     fn name(&self) -> &str {
         "TakeExec"
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {
@@ -638,13 +668,9 @@ impl ExecutionPlan for TakeExec {
             take_stream.apply(input_stream)
         });
         let output_schema = self.output_schema.clone();
-        let stream = lazy_take_stream
-            .flatten()
-            .boxed_stream_in_current_span()
-            .stream_in_span(info_span!(PHASE_LOAD_DATA_TAKE));
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             output_schema,
-            stream,
+            lazy_take_stream.flatten(),
         )))
     }
 
@@ -655,11 +681,11 @@ impl ExecutionPlan for TakeExec {
     fn partition_statistics(
         &self,
         partition: Option<usize>,
-    ) -> Result<datafusion::physical_plan::Statistics> {
-        Ok(Statistics {
+    ) -> Result<Arc<datafusion::physical_plan::Statistics>> {
+        Ok(Arc::new(Statistics {
             num_rows: self.input.partition_statistics(partition)?.num_rows,
             ..Statistics::new_unknown(self.schema().as_ref())
-        })
+        }))
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -845,6 +871,80 @@ mod tests {
         while let Some(batch) = stream.try_next().await.unwrap() {
             assert_eq!(&batch.schema().field_names(), &expected_fields);
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_take_records_output_and_io_metrics() {
+        use datafusion::physical_plan::metrics::MetricValue;
+        use lance_datafusion::utils::{BYTES_READ_METRIC, IOPS_METRIC, REQUESTS_METRIC};
+        let TestFixture {
+            dataset,
+            _tmp_dir_guard,
+        } = test_fixture().await;
+
+        let row_addrs = UInt64Array::from(vec![0_u64, 1, 2, 3, 4]);
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            ROW_ADDR,
+            DataType::UInt64,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(row_addrs)]).unwrap();
+        let stream = futures::stream::iter(vec![Ok(batch)]);
+        let stream = Box::pin(RecordBatchStreamAdapter::new(schema, stream));
+        let input = Arc::new(OneShotExec::new(stream));
+
+        let projection = dataset
+            .empty_projection()
+            .union_column("s", OnMissing::Error)
+            .unwrap();
+
+        let take_exec = TakeExec::try_new(dataset, input, projection)
+            .unwrap()
+            .unwrap();
+
+        let stream = take_exec
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 5);
+
+        let metrics = take_exec.metrics().unwrap();
+
+        let output_batches: usize = metrics
+            .iter()
+            .filter_map(|m| match m.value() {
+                MetricValue::OutputBatches(count) => Some(count.value()),
+                _ => None,
+            })
+            .sum();
+
+        let output_bytes: usize = metrics
+            .iter()
+            .filter_map(|m| match m.value() {
+                MetricValue::OutputBytes(count) => Some(count.value()),
+                _ => None,
+            })
+            .sum();
+
+        let gauge = |name: &str| -> usize {
+            metrics
+                .iter_gauges()
+                .find_map(|(metric_name, gauge)| {
+                    (metric_name.as_ref() == name).then(|| gauge.value())
+                })
+                .unwrap_or(0)
+        };
+
+        let bytes_read = gauge(BYTES_READ_METRIC);
+        let iops = gauge(IOPS_METRIC);
+        let requests = gauge(REQUESTS_METRIC);
+
+        assert_eq!(metrics.output_rows(), Some(5));
+        assert_eq!(metrics.find_count("batches_processed").unwrap().value(), 1);
+        assert!(
+            output_batches > 0 && output_bytes > 0 && bytes_read > 0 && iops > 0 && requests > 0,
+            "expected positive TakeExec metrics, got output_batches={output_batches}, output_bytes={output_bytes}, bytes_read={bytes_read}, iops={iops}, requests={requests}"
+        );
     }
 
     #[tokio::test]

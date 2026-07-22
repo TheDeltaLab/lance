@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::any::Any;
+#[cfg(test)]
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -17,7 +18,6 @@ use arrow_array::{
     cast::AsArray,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use arrow_select::concat::concat_batches;
 use datafusion::physical_plan::PlanProperties;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
@@ -39,7 +39,6 @@ use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt, future, stream};
 use itertools::Itertools;
 use lance_core::ROW_ID;
 use lance_core::utils::futures::FinallyStreamExt;
-use lance_core::utils::tracing::{PHASE_INDEX_SEARCH_ANN, StreamTracingExt};
 use lance_core::{
     ROW_ID_FIELD,
     utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu},
@@ -59,7 +58,7 @@ use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_arrow;
 use lance_table::format::IndexMetadata;
 use tokio::sync::Notify;
-use tracing::info_span;
+use uuid::Uuid;
 
 use crate::dataset::Dataset;
 use crate::index::DatasetIndexInternalExt;
@@ -69,8 +68,8 @@ use crate::{Error, Result};
 use lance_arrow::*;
 
 use super::utils::{
-    FilteredRowIdsToPrefilter, IndexMetrics, InstrumentedChildInputStream,
-    InstrumentedRecordBatchStreamAdapter, PreFilterSource, SelectionVectorToPrefilter,
+    FilteredRowIdsToPrefilter, IndexMetrics, InstrumentedRecordBatchStreamAdapter, PreFilterSource,
+    SelectionVectorToPrefilter,
 };
 
 pub const QUERY_INDEX_COL: &str = "query_index";
@@ -158,6 +157,7 @@ pub struct KNNVectorDistanceExec {
     pub upper_bound: Option<f32>,
     pub column: String,
     pub distance_type: DistanceType,
+    retain_vector: bool,
 
     input_schema: SchemaRef,
     output_schema: SchemaRef,
@@ -173,10 +173,11 @@ pub struct KnnBatchParams {
     pub lower_bound: Option<f32>,
     pub upper_bound: Option<f32>,
     pub distance_type: DistanceType,
+    pub retain_vector: bool,
 }
 
 struct BatchKnnConfig {
-    input_schema: SchemaRef,
+    stored_schema: SchemaRef,
     output_schema: SchemaRef,
     column: String,
     query: ArrayRef,
@@ -185,6 +186,7 @@ struct BatchKnnConfig {
     lower_bound: Option<f32>,
     upper_bound: Option<f32>,
     distance_type: DistanceType,
+    retain_vector: bool,
 }
 
 impl DisplayAs for KNNVectorDistanceExec {
@@ -217,6 +219,120 @@ impl DisplayAs for KNNVectorDistanceExec {
 }
 
 impl KNNVectorDistanceExec {
+    fn remove_field_path_from_fields(
+        fields: &[Arc<Field>],
+        path: &[String],
+    ) -> DataFusionResult<Vec<Arc<Field>>> {
+        if path.is_empty() {
+            return Ok(fields.to_vec());
+        }
+        let mut removed = false;
+        let mut new_fields = Vec::with_capacity(fields.len());
+        for field in fields {
+            if field.name() != &path[0] {
+                new_fields.push(field.clone());
+                continue;
+            }
+            removed = true;
+            if path.len() == 1 {
+                continue;
+            }
+            match field.data_type() {
+                DataType::Struct(children) => {
+                    let child_fields = children.iter().cloned().collect::<Vec<_>>();
+                    let projected_children =
+                        Self::remove_field_path_from_fields(&child_fields, &path[1..])?;
+                    if projected_children.is_empty() {
+                        continue;
+                    }
+                    let updated = Field::new(
+                        field.name(),
+                        DataType::Struct(projected_children.into()),
+                        field.is_nullable(),
+                    )
+                    .with_metadata(field.metadata().clone());
+                    new_fields.push(Arc::new(updated));
+                }
+                _ => {
+                    return Err(DataFusionError::Internal(format!(
+                        "batch KNN cannot remove nested path '{}': '{}' is not a struct",
+                        path.join("."),
+                        field.name()
+                    )));
+                }
+            }
+        }
+        if !removed {
+            return Err(DataFusionError::Internal(format!(
+                "batch KNN expected vector column '{}' in scan batch schema",
+                path.join(".")
+            )));
+        }
+        Ok(new_fields)
+    }
+
+    fn remove_vector_from_schema(schema: &Schema, column: &str) -> DataFusionResult<Schema> {
+        let path = lance_core::datatypes::parse_field_path(column).map_err(|err| {
+            DataFusionError::Internal(format!(
+                "batch KNN failed to parse vector column path '{column}': {err}"
+            ))
+        })?;
+        let fields = schema.fields().iter().cloned().collect::<Vec<_>>();
+        let updated_fields = Self::remove_field_path_from_fields(&fields, &path)?;
+        Ok(Schema::new_with_metadata(
+            updated_fields,
+            schema.metadata().clone(),
+        ))
+    }
+
+    fn remove_vector_from_batch(
+        batch: &RecordBatch,
+        column: &str,
+    ) -> DataFusionResult<RecordBatch> {
+        let slim_schema = Self::remove_vector_from_schema(batch.schema().as_ref(), column)?;
+        batch
+            .project_by_schema(&slim_schema)
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+    }
+
+    fn resolve_vector_column(batch: &RecordBatch, column: &str) -> DataFusionResult<ArrayRef> {
+        if let Some(col) = batch.column_by_name(column) {
+            return Ok(col.clone());
+        }
+        let parts = lance_core::datatypes::parse_field_path(column).map_err(|e| {
+            DataFusionError::Internal(format!(
+                "batch KNN failed to parse vector column path '{column}': {e}"
+            ))
+        })?;
+        if parts.is_empty() {
+            return Err(DataFusionError::Internal(format!(
+                "batch KNN has invalid empty vector column path '{column}'"
+            )));
+        }
+        let mut current = batch.column_by_name(&parts[0]).cloned().ok_or_else(|| {
+            DataFusionError::Internal(format!(
+                "batch KNN expected vector column '{column}' in scan batch (missing root field '{}')",
+                parts[0]
+            ))
+        })?;
+        for part in &parts[1..] {
+            let struct_array = current
+                .as_any()
+                .downcast_ref::<arrow_array::StructArray>()
+                .ok_or_else(|| {
+                    DataFusionError::Internal(format!(
+                        "batch KNN expected struct while resolving '{column}', but parent of '{part}' was not a struct"
+                    ))
+                })?;
+            current = struct_array.column_by_name(part).cloned().ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "batch KNN expected vector column '{column}' in scan batch (missing nested field '{part}')"
+                ))
+            })?;
+        }
+        Ok(current)
+    }
+
     /// Create a new [`KNNVectorDistanceExec`] node.
     ///
     /// Returns an error if the preconditions are not met.
@@ -237,6 +353,7 @@ impl KNNVectorDistanceExec {
                 lower_bound: None,
                 upper_bound: None,
                 distance_type,
+                retain_vector: false,
             },
         )
     }
@@ -254,6 +371,7 @@ impl KNNVectorDistanceExec {
             lower_bound,
             upper_bound,
             distance_type,
+            retain_vector,
         } = params;
         if query_count == 0 {
             return Err(Error::invalid_input(
@@ -288,13 +406,19 @@ impl KNNVectorDistanceExec {
                 "batch KNN cannot run when the input already contains reserved column '{QUERY_INDEX_COL}'"
             )));
         }
-        let input_schema = Arc::new(input_schema);
+
+        let stored_schema = if is_batch && !retain_vector {
+            Arc::new(Self::remove_vector_from_schema(&input_schema, column)?)
+        } else {
+            Arc::new(input_schema)
+        };
+
         let output_schema = if is_batch {
-            input_schema
+            stored_schema
                 .as_ref()
                 .try_with_column_at(0, query_index_field())?
         } else {
-            input_schema.as_ref().clone()
+            stored_schema.as_ref().clone()
         };
         let output_schema = Arc::new(output_schema.try_with_column(Field::new(
             DIST_COL,
@@ -331,11 +455,222 @@ impl KNNVectorDistanceExec {
             upper_bound,
             column: column.to_string(),
             distance_type,
-            input_schema,
+            retain_vector,
+            input_schema: stored_schema,
             output_schema,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
+    }
+
+    fn take_vector_row(vectors: &dyn Array, row_index: u32) -> DataFusionResult<ArrayRef> {
+        let indices = UInt32Array::from_iter([Some(row_index)]);
+        arrow_select::take::take(vectors, &indices, None)
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+    }
+
+    fn take_slim_batch_field(
+        results: &[BatchKnnCandidate],
+        field_name: &str,
+    ) -> DataFusionResult<ArrayRef> {
+        Self::take_slim_batch_field_if_present(results, field_name)?.ok_or_else(|| {
+            DataFusionError::Internal(format!("column '{field_name}' missing from slim batch"))
+        })
+    }
+
+    fn take_slim_batch_field_if_present(
+        results: &[BatchKnnCandidate],
+        field_name: &str,
+    ) -> DataFusionResult<Option<ArrayRef>> {
+        use std::collections::HashMap;
+
+        type SlimBatchGroup = (Arc<RecordBatch>, Vec<(usize, u32)>);
+        let mut groups: HashMap<*const RecordBatch, SlimBatchGroup> = HashMap::new();
+        for (result_index, candidate) in results.iter().enumerate() {
+            let BatchKnnExtra::WithSlimBatch {
+                slim_batch,
+                row_index,
+                ..
+            } = &candidate.extra
+            else {
+                return Err(DataFusionError::Internal(
+                    "batch KNN expected slim batch in candidate heap".to_string(),
+                ));
+            };
+            groups
+                .entry(Arc::as_ptr(slim_batch))
+                .or_insert_with(|| (Arc::clone(slim_batch), Vec::new()))
+                .1
+                .push((result_index, *row_index));
+        }
+
+        let mut ordered: Vec<Option<ArrayRef>> = vec![None; results.len()];
+        for (_, (slim_batch, entries)) in groups {
+            let indices =
+                UInt32Array::from_iter(entries.iter().map(|(_, row_index)| Some(*row_index)));
+            let taken = arrow_select::take::take_record_batch(slim_batch.as_ref(), &indices)
+                .map_err(|e| {
+                    DataFusionError::ArrowError(Box::new(e), Some("take top-k rows".to_string()))
+                })?;
+            let Some(column) = taken.column_by_name(field_name) else {
+                continue;
+            };
+            for (offset, (result_index, _)) in entries.iter().enumerate() {
+                ordered[*result_index] = Some(column.slice(offset, 1));
+            }
+        }
+        if ordered.iter().all(Option::is_none) {
+            return Ok(None);
+        }
+        if ordered.iter().any(Option::is_none) {
+            return Err(DataFusionError::Internal(format!(
+                "column '{field_name}' inconsistently present in slim batches"
+            )));
+        }
+
+        let row_arrays: Vec<&dyn Array> = ordered
+            .iter()
+            .map(|array| {
+                array
+                    .as_ref()
+                    .expect("every result mapped from slim batch")
+                    .as_ref()
+            })
+            .collect();
+        arrow::compute::concat(&row_arrays)
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+            .map(Some)
+    }
+
+    fn build_struct_column_for_path(
+        field: &Field,
+        path: &[String],
+        leaf_column: ArrayRef,
+        slim_column: Option<&dyn Array>,
+    ) -> DataFusionResult<ArrayRef> {
+        if path.is_empty() {
+            return Ok(leaf_column);
+        }
+        let DataType::Struct(children) = field.data_type() else {
+            return Err(DataFusionError::Internal(format!(
+                "batch KNN expected struct field '{}' while rebuilding nested vector path '{}'",
+                field.name(),
+                path.join(".")
+            )));
+        };
+        let slim_struct = slim_column
+            .map(|column| {
+                column
+                    .as_any()
+                    .downcast_ref::<arrow_array::StructArray>()
+                    .ok_or_else(|| {
+                        DataFusionError::Internal(format!(
+                            "batch KNN expected slim column '{}' to be a struct while rebuilding nested vector path '{}'",
+                            field.name(),
+                            path.join(".")
+                        ))
+                    })
+            })
+            .transpose()?;
+        let mut columns = Vec::with_capacity(children.len());
+        for child in children.iter() {
+            if child.name() == &path[0] {
+                if path.len() == 1 {
+                    columns.push(leaf_column.clone());
+                } else {
+                    let child_slim_column = slim_struct
+                        .and_then(|struct_array| struct_array.column_by_name(child.name()));
+                    columns.push(Self::build_struct_column_for_path(
+                        child,
+                        &path[1..],
+                        leaf_column.clone(),
+                        child_slim_column.map(|column| column.as_ref()),
+                    )?);
+                }
+            } else if let Some(column) =
+                slim_struct.and_then(|struct_array| struct_array.column_by_name(child.name()))
+            {
+                columns.push(column.clone());
+            } else {
+                columns.push(arrow_array::new_null_array(
+                    child.data_type(),
+                    leaf_column.len(),
+                ));
+            }
+        }
+        let struct_array = arrow_array::StructArray::try_new(
+            children.clone(),
+            columns,
+            slim_struct.and_then(|struct_array| struct_array.nulls().cloned()),
+        )
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        Ok(Arc::new(struct_array))
+    }
+
+    fn take_retained_vector_column(
+        results: &[BatchKnnCandidate],
+        field: &Field,
+        field_path: &[String],
+    ) -> DataFusionResult<ArrayRef> {
+        let vector_rows: Vec<&dyn Array> = results
+            .iter()
+            .map(|candidate| {
+                let BatchKnnExtra::WithSlimBatch {
+                    vector_row: Some(vector_row),
+                    ..
+                } = &candidate.extra
+                else {
+                    return Err(DataFusionError::Internal(
+                        "batch KNN expected vector rows in candidate heap".to_string(),
+                    ));
+                };
+                Ok(vector_row.as_ref())
+            })
+            .collect::<DataFusionResult<Vec<_>>>()?;
+        let leaf_column = arrow::compute::concat(&vector_rows)
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        if field_path.len() <= 1 {
+            Ok(leaf_column)
+        } else {
+            let slim_column = Self::take_slim_batch_field_if_present(results, field.name())?;
+            Self::build_struct_column_for_path(
+                field,
+                &field_path[1..],
+                leaf_column,
+                slim_column.as_deref(),
+            )
+        }
+    }
+
+    fn assemble_batch_output(
+        results: &[BatchKnnCandidate],
+        stored_schema: &Schema,
+        column: &str,
+        retain_vector: bool,
+    ) -> DataFusionResult<RecordBatch> {
+        let field_path = lance_core::datatypes::parse_field_path(column).map_err(|e| {
+            DataFusionError::Internal(format!(
+                "batch KNN failed to parse vector column path '{column}': {e}"
+            ))
+        })?;
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(stored_schema.fields().len());
+        for field in stored_schema.fields() {
+            if field.name() == ROW_ID {
+                let row_ids =
+                    UInt64Array::from_iter(results.iter().map(|candidate| Some(candidate.row_id)));
+                columns.push(Arc::new(row_ids));
+            } else if retain_vector && !field_path.is_empty() && field.name() == &field_path[0] {
+                columns.push(Self::take_retained_vector_column(
+                    results,
+                    field,
+                    &field_path,
+                )?);
+            } else {
+                columns.push(Self::take_slim_batch_field(results, field.name())?);
+            }
+        }
+        RecordBatch::try_new(Arc::new(stored_schema.clone()), columns)
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
     }
 
     async fn execute_batch(
@@ -343,7 +678,7 @@ impl KNNVectorDistanceExec {
         config: BatchKnnConfig,
     ) -> DataFusionResult<RecordBatch> {
         let BatchKnnConfig {
-            input_schema,
+            stored_schema,
             output_schema,
             column,
             query,
@@ -352,8 +687,10 @@ impl KNNVectorDistanceExec {
             lower_bound,
             upper_bound,
             distance_type,
+            retain_vector,
         } = config;
         let query_dim = query.len() / query_count;
+        let needs_slim_batch = stored_schema.fields().iter().any(|f| f.name() != ROW_ID);
         let mut heaps = (0..query_count)
             .map(|_| BinaryHeap::<BatchKnnCandidate>::with_capacity(k))
             .collect::<Vec<_>>();
@@ -374,6 +711,13 @@ impl KNNVectorDistanceExec {
                 })?
                 .as_primitive::<UInt64Type>()
                 .clone();
+
+            let mut slim_batch: Option<Arc<RecordBatch>> = None;
+            let vectors = if retain_vector {
+                Some(Self::resolve_vector_column(&batch, &column)?)
+            } else {
+                None
+            };
 
             for (query_index, heap) in heaps.iter_mut().enumerate().take(query_count) {
                 let key = query.slice(query_index * query_dim, query_dim);
@@ -399,20 +743,42 @@ impl KNNVectorDistanceExec {
                     }
                     let query_index = query_index as i32;
                     let row_id = row_ids.value(row_index);
-                    let row_index = row_index as u32;
+                    if !would_enter_heap(heap, k, distance, row_id, query_index) {
+                        continue;
+                    }
+
+                    let extra = if retain_vector || needs_slim_batch {
+                        let row_index = row_index as u32;
+                        if slim_batch.is_none() {
+                            let slim = Self::remove_vector_from_batch(&batch, &column)?;
+                            slim_batch = Some(Arc::new(slim));
+                        }
+                        let slim_batch = slim_batch.as_ref().expect("slim batch");
+                        let vector_row = if retain_vector {
+                            Some(Self::take_vector_row(
+                                vectors.as_ref().expect("vectors"),
+                                row_index,
+                            )?)
+                        } else {
+                            None
+                        };
+                        BatchKnnExtra::WithSlimBatch {
+                            slim_batch: Arc::clone(slim_batch),
+                            row_index,
+                            vector_row,
+                        }
+                    } else {
+                        BatchKnnExtra::RowIdOnly
+                    };
                     let candidate = BatchKnnCandidate {
                         query_index,
                         distance,
                         row_id,
-                        batch: batch.clone(),
-                        row_index,
+                        extra,
                     };
                     if heap.len() < k {
                         heap.push(candidate);
-                    } else if heap
-                        .peek()
-                        .is_some_and(|worst| candidate.cmp(worst).is_lt())
-                    {
+                    } else {
                         heap.pop();
                         heap.push(candidate);
                     }
@@ -437,20 +803,14 @@ impl KNNVectorDistanceExec {
 
         let mut query_indices = Int32Builder::with_capacity(results.len());
         let mut distances = Float32Builder::with_capacity(results.len());
-        let mut row_batches = Vec::with_capacity(results.len());
-        for result in results {
+        for result in &results {
             query_indices.append_value(result.query_index);
             distances.append_value(result.distance);
-            let indices = UInt32Array::from(vec![result.row_index]);
-            row_batches.push(
-                arrow_select::take::take_record_batch(&result.batch, &indices).map_err(|e| {
-                    DataFusionError::ArrowError(Box::new(e), Some("take top-k row".to_string()))
-                })?,
-            );
         }
 
-        let output = concat_batches(&input_schema, &row_batches)
-            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        let output =
+            Self::assemble_batch_output(&results, stored_schema.as_ref(), &column, retain_vector)?;
+
         output
             .try_with_column_at(0, query_index_field(), Arc::new(query_indices.finish()))
             .and_then(|batch| {
@@ -466,10 +826,6 @@ impl KNNVectorDistanceExec {
 impl ExecutionPlan for KNNVectorDistanceExec {
     fn name(&self) -> &str {
         "KNNVectorDistanceExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     /// Flat KNN inherits the schema from input node, and add one distance column.
@@ -502,6 +858,7 @@ impl ExecutionPlan for KNNVectorDistanceExec {
                 lower_bound: self.lower_bound,
                 upper_bound: self.upper_bound,
                 distance_type: self.distance_type,
+                retain_vector: self.retain_vector,
             },
         )?))
     }
@@ -516,7 +873,7 @@ impl ExecutionPlan for KNNVectorDistanceExec {
             let stream = stream::once(Self::execute_batch(
                 input_stream,
                 BatchKnnConfig {
-                    input_schema: self.input_schema.clone(),
+                    stored_schema: self.input_schema.clone(),
                     output_schema: self.output_schema.clone(),
                     column: self.column.clone(),
                     query: self.query.clone(),
@@ -525,6 +882,7 @@ impl ExecutionPlan for KNNVectorDistanceExec {
                     lower_bound: self.lower_bound,
                     upper_bound: self.upper_bound,
                     distance_type: self.distance_type,
+                    retain_vector: self.retain_vector,
                 },
             ));
             let schema = self.schema();
@@ -535,43 +893,35 @@ impl ExecutionPlan for KNNVectorDistanceExec {
                 &self.metrics,
             )) as SendableRecordBatchStream);
         }
-        let input_schema = self.input.schema();
         let key = self.query.clone();
         let column = self.column.clone();
         let dt = self.distance_type;
         let schema = self.schema();
 
         // Empty batches don't have a vector column to score; filter them out
-        // before reaching the helper so the transform always sees real work.
-        let filtered_input = Box::pin(RecordBatchStreamAdapter::new(
-            input_schema,
-            input_stream.try_filter(|batch| future::ready(batch.num_rows() > 0)),
-        )) as SendableRecordBatchStream;
+        // before the transform so it always sees real work.
+        let filtered_input = input_stream.try_filter(|batch| future::ready(batch.num_rows() > 0));
 
-        // Mirror of the helper's elapsed_compute counter; used to attribute
-        // wall-clock from the spawn_blocking distance kernel back onto the
-        // node's `elapsed_compute` metric.
-        let elapsed_compute = BaselineMetrics::new(&self.metrics, partition)
-            .elapsed_compute()
-            .clone();
+        let baseline = BaselineMetrics::new(&self.metrics, partition);
+        let elapsed_compute = baseline.elapsed_compute().clone();
 
-        let stream = InstrumentedChildInputStream::new(
-            filtered_input,
-            schema,
-            move |batch| {
+        let stream = filtered_input
+            .map(move |batch_result| {
                 let key = key.clone();
                 let column = column.clone();
                 let elapsed_compute = elapsed_compute.clone();
                 async move {
+                    let batch = batch_result?;
                     // Time around the .await to capture the spawn_blocking
                     // distance work, which otherwise runs while this future is
-                    // Pending and is missed by the helper's own poll timer.
+                    // Pending and is missed by a poll-time timer.
                     let start = Instant::now();
                     let batch = compute_distance(key, dt, &column, batch)
                         .await
                         .map_err(|e| DataFusionError::External(Box::new(e)))?;
                     elapsed_compute.add_duration(start.elapsed());
 
+                    let _t = elapsed_compute.timer();
                     let distances = batch[DIST_COL].as_primitive::<Float32Type>();
                     let distance_values = distances.values();
                     let mask = BooleanArray::from_iter((0..distances.len()).map(|row_index| {
@@ -580,50 +930,61 @@ impl ExecutionPlan for KNNVectorDistanceExec {
                     arrow::compute::filter_record_batch(&batch, &mask)
                         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
                 }
-            },
-            get_num_compute_intensive_cpus(),
-            partition,
-            &self.metrics,
-        );
-        Ok(Box::pin(stream) as SendableRecordBatchStream)
+            })
+            .buffer_unordered(get_num_compute_intensive_cpus());
+
+        let stream = stream.map(move |batch| {
+            let poll = baseline.record_poll(std::task::Poll::Ready(Some(batch)));
+            match poll {
+                std::task::Poll::Ready(Some(b)) => b,
+                _ => unreachable!("record_poll preserves Ready(Some) input"),
+            }
+        });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> DataFusionResult<Statistics> {
+    fn partition_statistics(&self, partition: Option<usize>) -> DataFusionResult<Arc<Statistics>> {
         let inner_stats = self.input.partition_statistics(partition)?;
-        let schema = self.input.schema();
-        let dist_stats = inner_stats
+        let input_schema = self.input.schema();
+        let input_stats_by_name = inner_stats
             .column_statistics
             .iter()
-            .zip(schema.fields())
-            .find(|(_, field)| field.name() == &self.column)
-            .map(|(stats, _)| ColumnStatistics {
+            .zip(input_schema.fields())
+            .map(|(stats, field)| (field.name().as_str(), stats.clone()))
+            .collect::<HashMap<_, _>>();
+        let vector_root = lance_core::datatypes::parse_field_path(&self.column)
+            .ok()
+            .and_then(|parts| parts.first().cloned())
+            .unwrap_or_else(|| self.column.clone());
+        let dist_stats = input_stats_by_name
+            .get(vector_root.as_str())
+            .map(|stats| ColumnStatistics {
                 null_count: stats.null_count,
                 ..Default::default()
             })
             .unwrap_or_default();
-        let column_statistics = inner_stats
-            .column_statistics
-            .into_iter()
-            .zip(schema.fields())
-            .filter(|(_, field)| field.name() != DIST_COL)
-            .map(|(stats, _)| stats)
+        let column_statistics = self
+            .output_schema
+            .fields()
+            .iter()
+            .map(|field| {
+                if field.name() == QUERY_INDEX_COL {
+                    ColumnStatistics::default()
+                } else if field.name() == DIST_COL {
+                    dist_stats.clone()
+                } else {
+                    input_stats_by_name
+                        .get(field.name().as_str())
+                        .cloned()
+                        .unwrap_or_default()
+                }
+            })
             .collect::<Vec<_>>();
-        let column_statistics = if self.is_batch {
-            std::iter::once(ColumnStatistics::default())
-                .chain(column_statistics)
-                .chain(std::iter::once(dist_stats))
-                .collect::<Vec<_>>()
-        } else {
-            column_statistics
-                .into_iter()
-                .chain(std::iter::once(dist_stats))
-                .collect::<Vec<_>>()
-        };
-        Ok(Statistics {
+        Ok(Arc::new(Statistics {
             num_rows: inner_stats.num_rows,
             column_statistics,
             ..Statistics::new_unknown(self.schema().as_ref())
-        })
+        }))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -639,11 +1000,9 @@ impl ExecutionPlan for KNNVectorDistanceExec {
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        if self.is_batch {
-            vec![Distribution::SinglePartition]
-        } else {
-            vec![Distribution::UnspecifiedDistribution]
-        }
+        // Both batch and non-batch modes execute a single input partition at a time,
+        // so all input must be coalesced to one partition before distance computation.
+        vec![Distribution::SinglePartition]
     }
 }
 
@@ -652,8 +1011,37 @@ struct BatchKnnCandidate {
     query_index: i32,
     distance: f32,
     row_id: u64,
-    batch: RecordBatch,
-    row_index: u32,
+    extra: BatchKnnExtra,
+}
+
+#[derive(Clone)]
+enum BatchKnnExtra {
+    RowIdOnly,
+    WithSlimBatch {
+        slim_batch: Arc<RecordBatch>,
+        row_index: u32,
+        vector_row: Option<ArrayRef>,
+    },
+}
+
+fn would_enter_heap(
+    heap: &BinaryHeap<BatchKnnCandidate>,
+    k: usize,
+    distance: f32,
+    row_id: u64,
+    query_index: i32,
+) -> bool {
+    if heap.len() < k {
+        return true;
+    }
+    let worst = heap.peek().expect("heap non-empty when len >= k");
+    let probe = BatchKnnCandidate {
+        query_index,
+        distance,
+        row_id,
+        extra: BatchKnnExtra::RowIdOnly,
+    };
+    probe.cmp(worst).is_lt()
 }
 
 impl PartialEq for BatchKnnCandidate {
@@ -661,7 +1049,6 @@ impl PartialEq for BatchKnnCandidate {
         self.query_index == other.query_index
             && self.distance == other.distance
             && self.row_id == other.row_id
-            && self.row_index == other.row_index
     }
 }
 
@@ -679,7 +1066,6 @@ impl Ord for BatchKnnCandidate {
             .total_cmp(&other.distance)
             .then_with(|| self.row_id.cmp(&other.row_id))
             .then_with(|| self.query_index.cmp(&other.query_index))
-            .then_with(|| self.row_index.cmp(&other.row_index))
     }
 }
 
@@ -721,7 +1107,7 @@ pub fn new_knn_exec(
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let ivf_node = ANNIvfPartitionExec::try_new(
         dataset.clone(),
-        indices.iter().map(|idx| idx.uuid.to_string()).collect_vec(),
+        indices.iter().map(|idx| idx.uuid).collect_vec(),
         query.clone(),
     )?;
 
@@ -767,7 +1153,7 @@ pub struct ANNIvfPartitionExec {
     pub query: Query,
 
     /// The UUIDs of the indices to search.
-    pub index_uuids: Vec<String>,
+    pub index_uuids: Vec<Uuid>,
 
     pub properties: Arc<PlanProperties>,
 
@@ -775,7 +1161,7 @@ pub struct ANNIvfPartitionExec {
 }
 
 impl ANNIvfPartitionExec {
-    pub fn try_new(dataset: Arc<Dataset>, index_uuids: Vec<String>, query: Query) -> Result<Self> {
+    pub fn try_new(dataset: Arc<Dataset>, index_uuids: Vec<Uuid>, query: Query) -> Result<Self> {
         let dataset_schema = dataset.schema();
         get_vector_type(dataset_schema, &query.column)?;
         if index_uuids.is_empty() {
@@ -834,10 +1220,6 @@ impl ExecutionPlan for ANNIvfPartitionExec {
         "ANNIVFPartitionExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         KNN_PARTITION_SCHEMA.clone()
     }
@@ -846,11 +1228,11 @@ impl ExecutionPlan for ANNIvfPartitionExec {
         &self.properties
     }
 
-    fn partition_statistics(&self, _partition: Option<usize>) -> DataFusionResult<Statistics> {
-        Ok(Statistics {
+    fn partition_statistics(&self, _partition: Option<usize>) -> DataFusionResult<Arc<Statistics>> {
+        Ok(Arc::new(Statistics {
             num_rows: Precision::Exact(self.query.minimum_nprobes),
             ..Statistics::new_unknown(self.schema().as_ref())
-        })
+        }))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -877,10 +1259,11 @@ impl ExecutionPlan for ANNIvfPartitionExec {
     fn execute(
         &self,
         partition: usize,
-        _context: Arc<datafusion::execution::TaskContext>,
+        context: Arc<datafusion::execution::TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let timer = Instant::now();
 
+        let target_partitions = context.session_config().target_partitions();
         let query = self.query.clone();
         let ds = self.dataset.clone();
         let metrics = Arc::new(AnnPartitionMetrics::new(&self.metrics, partition));
@@ -916,7 +1299,7 @@ impl ExecutionPlan for ANNIvfPartitionExec {
                     dist_q_c_list_builder.append_value(dist_q_c.iter());
                     let dist_q_c_col = dist_q_c_list_builder.finish();
 
-                    let uuid_col = StringArray::from(vec![uuid.as_str()]);
+                    let uuid_col = StringArray::from(vec![uuid.to_string()]);
                     let batch = RecordBatch::try_new(
                         KNN_PARTITION_SCHEMA.clone(),
                         vec![
@@ -929,8 +1312,11 @@ impl ExecutionPlan for ANNIvfPartitionExec {
                     Ok::<_, DataFusionError>(batch)
                 }
             })
-            .buffered(self.index_uuids.len())
+            .buffered(self.index_uuids.len().min(target_partitions).max(1))
             .finally(move || {
+                // Partition ranking reads centroids from memory, so this is
+                // typically zero; flushed for symmetry with ANNSubIndex.
+                metrics_clone.index_metrics.flush_io();
                 metrics_clone.baseline_metrics.done();
                 metrics_clone
                     .baseline_metrics
@@ -938,10 +1324,10 @@ impl ExecutionPlan for ANNIvfPartitionExec {
                     .add_duration(timer.elapsed());
             });
         let schema = self.schema();
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            schema,
-            stream.boxed_stream_in_span(info_span!(PHASE_INDEX_SEARCH_ANN)),
-        )) as SendableRecordBatchStream)
+        Ok(
+            Box::pin(RecordBatchStreamAdapter::new(schema, stream.boxed()))
+                as SendableRecordBatchStream,
+        )
     }
 
     fn supports_limit_pushdown(&self) -> bool {
@@ -1150,8 +1536,14 @@ impl PartitionSearchControl for LatePartitionSearchControl {
     }
 }
 
-fn effective_query_parallelism(query: &Query, index: &dyn VectorIndex) -> usize {
-    let cpu_pool_size = get_num_compute_intensive_cpus();
+fn effective_query_parallelism(
+    query: &Query,
+    index: &dyn VectorIndex,
+    target_partitions: usize,
+) -> usize {
+    let cpu_pool_size = get_num_compute_intensive_cpus()
+        .min(target_partitions)
+        .max(1);
     effective_query_parallelism_for(
         query,
         cpu_pool_size,
@@ -1213,6 +1605,7 @@ impl ANNIvfSubIndexExec {
             .boxed()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn late_search(
         index: Arc<dyn VectorIndex>,
         query: Query,
@@ -1221,6 +1614,7 @@ impl ANNIvfSubIndexExec {
         prefilter: Arc<DatasetPreFilter>,
         metrics: Arc<AnnIndexMetrics>,
         state: Arc<ANNIvfEarlySearchResults>,
+        target_partitions: usize,
     ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
         let stream = futures::stream::once(async move {
             let max_nprobes = query
@@ -1290,7 +1684,8 @@ impl ANNIvfSubIndexExec {
 
             let state_clone = state.clone();
 
-            let query_parallelism = effective_query_parallelism(&query, index.as_ref());
+            let query_parallelism =
+                effective_query_parallelism(&query, index.as_ref(), target_partitions);
             if query_parallelism <= 1 {
                 return stream::once(async move {
                     let prefilter: Arc<dyn PreFilter> = prefilter;
@@ -1361,6 +1756,7 @@ impl ANNIvfSubIndexExec {
         stream.flatten()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn initial_search(
         index: Arc<dyn VectorIndex>,
         query: Query,
@@ -1369,10 +1765,12 @@ impl ANNIvfSubIndexExec {
         prefilter: Arc<DatasetPreFilter>,
         metrics: Arc<AnnIndexMetrics>,
         state: Arc<ANNIvfEarlySearchResults>,
+        target_partitions: usize,
     ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
         let minimum_nprobes = query.minimum_nprobes.min(partitions.len());
 
-        let query_parallelism = effective_query_parallelism(&query, index.as_ref());
+        let query_parallelism =
+            effective_query_parallelism(&query, index.as_ref(), target_partitions);
         if query_parallelism <= 1 {
             metrics.partitions_searched.add(minimum_nprobes);
             return stream::once(async move {
@@ -1434,10 +1832,6 @@ impl ANNIvfSubIndexExec {
 impl ExecutionPlan for ANNIvfSubIndexExec {
     fn name(&self) -> &str {
         "ANNSubIndexExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> arrow_schema::SchemaRef {
@@ -1504,6 +1898,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
     ) -> DataFusionResult<datafusion::physical_plan::SendableRecordBatchStream> {
         let input_stream = self.input.execute(partition, context.clone())?;
         let schema = self.schema();
+        let target_partitions = context.session_config().target_partitions();
         let query = self.query.clone();
         let ds = self.dataset.clone();
         let column = self.query.column.clone();
@@ -1542,7 +1937,11 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             Arc::new(part_id.unwrap().as_primitive::<UInt32Type>().clone());
                         let dist_q_c =
                             Arc::new(dist_q_c.unwrap().as_primitive::<Float32Type>().clone());
-                        let uuid = uuid.unwrap().to_string();
+                        let uuid = Uuid::parse_str(uuid.unwrap()).map_err(|e| {
+                            DataFusionError::Execution(format!(
+                                "Invalid UUID in __index_uuid column: {e}"
+                            ))
+                        })?;
                         Ok((partitions, dist_q_c, uuid))
                     })
                     .collect_vec();
@@ -1595,6 +1994,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             pre_filter.clone(),
                             metrics.clone(),
                             state.clone(),
+                            target_partitions,
                         );
                         let late_search = Self::late_search(
                             raw_index.clone(),
@@ -1604,6 +2004,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             pre_filter,
                             metrics,
                             state,
+                            target_partitions,
                         );
                         DataFusionResult::Ok(early_search.chain(late_search).boxed())
                     }
@@ -1613,21 +2014,24 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                 // will not start until the early search is complete across all deltas.
                 .try_flatten_unordered(None)
                 .finally(move || {
+                    // Publish the exact index-file I/O measured for this query
+                    // (cache misses only) to the iops/requests/bytes_read gauges.
+                    metrics_clone.index_metrics.flush_io();
                     metrics_clone
                         .baseline_metrics
                         .elapsed_compute()
                         .add_duration(timer.elapsed());
                     metrics_clone.baseline_metrics.done();
                 })
-                .boxed_stream_in_span(info_span!(PHASE_INDEX_SEARCH_ANN)),
+                .boxed(),
         )))
     }
 
     fn partition_statistics(
         &self,
         partition: Option<usize>,
-    ) -> DataFusionResult<datafusion::physical_plan::Statistics> {
-        Ok(Statistics {
+    ) -> DataFusionResult<Arc<datafusion::physical_plan::Statistics>> {
+        Ok(Arc::new(Statistics {
             num_rows: Precision::Exact(
                 self.query.k
                     * self.query.refine_factor.unwrap_or(1) as usize
@@ -1639,7 +2043,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                         .unwrap_or(&1),
             ),
             ..Statistics::new_unknown(self.schema().as_ref())
-        })
+        }))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -1720,10 +2124,6 @@ impl DisplayAs for MultivectorScoringExec {
 impl ExecutionPlan for MultivectorScoringExec {
     fn name(&self) -> &str {
         "MultivectorScoringExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> arrow_schema::SchemaRef {
@@ -1873,17 +2273,20 @@ impl ExecutionPlan for MultivectorScoringExec {
 mod tests {
     use super::*;
 
+    use std::any::Any;
+
     use crate::index::DatasetIndexExt;
     use arrow::compute::{concat_batches, sort_to_indices, take_record_batch};
     use arrow::datatypes::Float32Type;
     use arrow_array::{
         ArrayRef, FixedSizeListArray, Float32Array, Int32Array, RecordBatchIterator, StringArray,
+        StructArray,
     };
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
     use async_trait::async_trait;
     use datafusion::error::Result as DataFusionResult;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-    use deepsize::DeepSizeOf;
+    use lance_core::deepsize::DeepSizeOf;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
     use lance_datafusion::utils::FIND_PARTITIONS_ELAPSED_METRIC;
@@ -1903,6 +2306,7 @@ mod tests {
 
     use crate::dataset::{WriteMode, WriteParams};
     use crate::index::vector::VectorIndexParams;
+    use crate::index::vector::ivf::v2::STREAMING_SEARCH_BATCH_SIZE;
     use crate::io::exec::testing::TestingExec;
 
     fn base_query() -> Query {
@@ -1920,6 +2324,7 @@ mod tests {
             use_index: true,
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
+            approx_mode: Default::default(),
         }
     }
 
@@ -1945,6 +2350,36 @@ mod tests {
         assert_eq!(effective_query_parallelism_for(&query, 16, 1), 16);
     }
 
+    #[test]
+    fn test_effective_query_parallelism_respects_target_partitions() {
+        // effective_query_parallelism caps cpu_pool_size at target_partitions before
+        // passing it to effective_query_parallelism_for, so the ceiling is
+        // min(cpu_pool_size, target_partitions).
+        let mut query = base_query();
+        let cpu_pool_size = 16;
+
+        // use-all-cpus mode: capped at target_partitions
+        query.query_parallelism = -1;
+        assert_eq!(
+            effective_query_parallelism_for(&query, cpu_pool_size.min(4), 1),
+            4
+        );
+
+        // auto mode: auto_parallelism also clamped to the reduced cpu_pool_size
+        query.query_parallelism = 0;
+        assert_eq!(
+            effective_query_parallelism_for(&query, cpu_pool_size.min(4), 8),
+            4
+        );
+
+        // explicit parallelism > target_partitions: clamped down
+        query.query_parallelism = 16;
+        assert_eq!(
+            effective_query_parallelism_for(&query, cpu_pool_size.min(4), 1),
+            4
+        );
+    }
+
     #[derive(Debug, DeepSizeOf)]
     struct ThreadCapturingIndex {
         thread_name: Arc<Mutex<Option<String>>>,
@@ -1967,10 +2402,6 @@ mod tests {
 
         fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
             self
-        }
-
-        fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
-            Ok(self)
         }
 
         fn statistics(&self) -> Result<serde_json::Value> {
@@ -2049,7 +2480,7 @@ mod tests {
             Box::new(self.row_ids.iter())
         }
 
-        async fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+        async fn remap(&mut self, _mapping: &RowAddrRemap) -> Result<()> {
             Ok(())
         }
 
@@ -2091,10 +2522,6 @@ mod tests {
 
         fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
             self
-        }
-
-        fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
-            Ok(self)
         }
 
         fn statistics(&self) -> Result<serde_json::Value> {
@@ -2193,7 +2620,6 @@ mod tests {
             _metrics: Arc<dyn lance_index::metrics::MetricsCollector>,
         ) -> Result<SendableRecordBatchStream> {
             let (batch_tx, batch_rx) = mpsc::channel(1);
-            let batch_tx_for_search = batch_tx.clone();
             let prepared_partition_ids = (start_idx..end_idx)
                 .map(|idx| partitions.value(idx) as usize)
                 .collect::<Vec<_>>();
@@ -2201,42 +2627,74 @@ mod tests {
                 .lock()
                 .unwrap()
                 .extend(prepared_partition_ids.iter().copied());
+            // Mirror the production streaming path (v2.rs): search prepared partitions
+            // in batches of STREAMING_SEARCH_BATCH_SIZE, one `spawn_cpu` per batch, with
+            // the channel send in async code so no CPU-pool thread parks (#7642).
             tokio::spawn(async move {
-                let search_result = spawn_cpu(move || -> DataFusionResult<()> {
-                    for partition_id in prepared_partition_ids {
-                        if control
-                            .as_ref()
-                            .is_some_and(|control| control.should_stop())
-                        {
-                            return Ok(());
+                for chunk in prepared_partition_ids.chunks(*STREAMING_SEARCH_BATCH_SIZE) {
+                    if control
+                        .as_ref()
+                        .is_some_and(|control| control.should_stop())
+                        || batch_tx.is_closed()
+                    {
+                        return;
+                    }
+                    let chunk = chunk.to_vec();
+                    let index = self.clone();
+                    let control_for_search = control.clone();
+                    let cancel_probe = batch_tx.clone();
+                    let search_output = spawn_cpu(move || {
+                        let mut outputs: Vec<DataFusionResult<RecordBatch>> =
+                            Vec::with_capacity(chunk.len());
+                        let mut stopped = false;
+                        for partition_id in chunk {
+                            if control_for_search
+                                .as_ref()
+                                .is_some_and(|control| control.should_stop())
+                                || cancel_probe.is_closed()
+                            {
+                                stopped = true;
+                                break;
+                            }
+                            match index
+                                .search_prepared_partition(
+                                    Box::new(partition_id),
+                                    &lance_index::metrics::NoOpMetricsCollector,
+                                )
+                                .map_err(datafusion::error::DataFusionError::from)
+                            {
+                                Ok(batch) => {
+                                    if let Some(control) = control_for_search.as_ref() {
+                                        control.record_batch(&batch);
+                                    }
+                                    outputs.push(Ok(batch));
+                                }
+                                Err(err) => {
+                                    outputs.push(Err(err));
+                                    stopped = true;
+                                    break;
+                                }
+                            }
                         }
-                        let batch = self
-                            .search_prepared_partition(
-                                Box::new(partition_id),
-                                &lance_index::metrics::NoOpMetricsCollector,
-                            )
-                            .map_err(datafusion::error::DataFusionError::from);
-                        match batch {
-                            Ok(batch) => {
-                                if let Some(control) = control.as_ref() {
-                                    control.record_batch(&batch);
-                                }
-                                if batch_tx_for_search.blocking_send(Ok(batch)).is_err() {
-                                    return Ok(());
-                                }
-                            }
-                            Err(err) => {
-                                let _ = batch_tx_for_search.blocking_send(Err(err));
-                                return Ok(());
-                            }
+                        Ok::<_, datafusion::error::DataFusionError>((outputs, stopped))
+                    })
+                    .await;
+
+                    let (outputs, stopped) = match search_output {
+                        Ok(output) => output,
+                        Err(err) => {
+                            let _ = batch_tx.send(Err(err)).await;
+                            return;
+                        }
+                    };
+                    for output in outputs {
+                        if batch_tx.send(output).await.is_err() {
+                            return;
                         }
                     }
-                    Ok(())
-                })
-                .await;
-
-                if let Err(err) = search_result {
-                    let _ = batch_tx.send(Err(err)).await;
+                    if stopped {
+                        return;
+                    }
                 }
             });
 
@@ -2271,7 +2729,7 @@ mod tests {
             Box::new(self.row_ids.iter())
         }
 
-        async fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+        async fn remap(&mut self, _mapping: &RowAddrRemap) -> Result<()> {
             Ok(())
         }
 
@@ -2430,32 +2888,44 @@ mod tests {
         );
     }
 
+    // All partitions fit in a single search batch, so they are searched in one
+    // `spawn_cpu` dispatch and therefore share one cpu thread. The partition count
+    // adapts to the configured batch size so the single-batch property holds under
+    // any valid `LANCE_IVF_STREAMING_SEARCH_BATCH_SIZE`, including 1.
     #[tokio::test]
     async fn test_sequential_initial_search_prepares_all_then_searches_on_one_cpu_thread() {
+        let num_partitions = 3.min(*STREAMING_SEARCH_BATCH_SIZE);
+        let row_ids = (0..num_partitions).map(|i| 10 + i as u64).collect();
         let (index, prepared_partitions, searched_partitions, search_threads) =
-            prepared_index(vec![10, 11, 12]);
+            prepared_index(row_ids);
         let mut query = base_query();
-        query.minimum_nprobes = 3;
+        query.minimum_nprobes = num_partitions;
         let state = Arc::new(ANNIvfEarlySearchResults::new(1, query.k));
 
+        let partition_idx = (0..num_partitions as u32).collect::<Vec<_>>();
+        let q_c_dists = (0..num_partitions)
+            .map(|i| i as f32 * 0.1)
+            .collect::<Vec<_>>();
         let batches = ANNIvfSubIndexExec::initial_search(
             index,
             query,
-            Arc::new(UInt32Array::from(vec![0, 1, 2])),
-            Arc::new(Float32Array::from(vec![0.1, 0.2, 0.3])),
+            Arc::new(UInt32Array::from(partition_idx)),
+            Arc::new(Float32Array::from(q_c_dists)),
             empty_prefilter().await,
             prepared_metrics(),
             state,
+            usize::MAX,
         )
         .try_collect::<Vec<_>>()
         .await
         .unwrap();
 
-        assert_eq!(batches.len(), 3);
-        assert_eq!(*prepared_partitions.lock().unwrap(), vec![0, 1, 2]);
-        assert_eq!(*searched_partitions.lock().unwrap(), vec![0, 1, 2]);
+        let expected: Vec<usize> = (0..num_partitions).collect();
+        assert_eq!(batches.len(), num_partitions);
+        assert_eq!(*prepared_partitions.lock().unwrap(), expected);
+        assert_eq!(*searched_partitions.lock().unwrap(), expected);
         let search_threads = search_threads.lock().unwrap().clone();
-        assert_eq!(search_threads.len(), 3);
+        assert_eq!(search_threads.len(), num_partitions);
         assert!(
             search_threads.iter().all(|name| name.contains("lance-cpu")),
             "expected prepared searches to run on the cpu runtime, got threads {search_threads:?}",
@@ -2463,6 +2933,52 @@ mod tests {
         assert!(
             search_threads.iter().all(|name| name == &search_threads[0]),
             "expected all prepared searches to reuse one cpu thread, got threads {search_threads:?}",
+        );
+    }
+
+    // Regression guard for the batched streaming search (#7642): with more partitions
+    // than a single batch, the search spans multiple `spawn_cpu` dispatches. Verify that
+    // every partition is still prepared and searched in order across the batch boundary,
+    // and that all search work stays on the cpu runtime.
+    //
+    // Note: this does not reproduce the single-thread-pool deadlock the async recv/send
+    // fixes -- that requires a 1-thread CPU pool, which is a process-global singleton and
+    // impractical to force in a unit test (same limitation noted for the #7423 fix).
+    #[tokio::test]
+    async fn test_sequential_search_spans_multiple_cpu_batches() {
+        let num_partitions = *STREAMING_SEARCH_BATCH_SIZE + 3;
+        let row_ids = (0..num_partitions).map(|i| i as u64 * 10).collect();
+        let (index, prepared_partitions, searched_partitions, search_threads) =
+            prepared_index(row_ids);
+        let mut query = base_query();
+        query.minimum_nprobes = num_partitions;
+        let state = Arc::new(ANNIvfEarlySearchResults::new(1, query.k));
+
+        let partition_idx = (0..num_partitions as u32).collect::<Vec<_>>();
+        let q_c_dists = (0..num_partitions).map(|i| i as f32).collect::<Vec<_>>();
+        let batches = ANNIvfSubIndexExec::initial_search(
+            index,
+            query,
+            Arc::new(UInt32Array::from(partition_idx.clone())),
+            Arc::new(Float32Array::from(q_c_dists)),
+            empty_prefilter().await,
+            prepared_metrics(),
+            state,
+            usize::MAX,
+        )
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        let expected: Vec<usize> = (0..num_partitions).collect();
+        assert_eq!(batches.len(), num_partitions);
+        assert_eq!(*prepared_partitions.lock().unwrap(), expected);
+        assert_eq!(*searched_partitions.lock().unwrap(), expected);
+        let search_threads = search_threads.lock().unwrap().clone();
+        assert_eq!(search_threads.len(), num_partitions);
+        assert!(
+            search_threads.iter().all(|name| name.contains("lance-cpu")),
+            "expected prepared searches to run on the cpu runtime, got threads {search_threads:?}",
         );
     }
 
@@ -2494,6 +3010,7 @@ mod tests {
             empty_prefilter().await,
             prepared_metrics(),
             state.clone(),
+            usize::MAX,
         )
         .try_collect::<Vec<_>>()
         .await
@@ -2631,6 +3148,254 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_batch_partition_statistics_aligns_with_output_schema() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("i", DataType::Int32, true),
+            ArrowField::new(
+                "vec",
+                DataType::FixedSizeList(
+                    Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                    4,
+                ),
+                true,
+            ),
+            ROW_ID_FIELD.clone(),
+        ]));
+        let batch = RecordBatch::new_empty(schema);
+        let input: Arc<dyn ExecutionPlan> = Arc::new(TestingExec::new(vec![batch]));
+        let query = Arc::new(Float32Array::from(vec![0.0, 1.0, 2.0, 3.0])) as ArrayRef;
+        let plan = KNNVectorDistanceExec::try_new_batch(
+            input,
+            "vec",
+            query,
+            KnnBatchParams {
+                is_batch: true,
+                query_count: 1,
+                k: 2,
+                lower_bound: None,
+                upper_bound: None,
+                distance_type: DistanceType::L2,
+                retain_vector: false,
+            },
+        )
+        .unwrap();
+        let stats = plan.partition_statistics(None).unwrap();
+        assert_eq!(
+            stats.column_statistics.len(),
+            plan.schema().fields().len(),
+            "partition stats must align with output schema"
+        );
+        let schema = plan.schema();
+        let query_index_pos = schema
+            .column_with_name(QUERY_INDEX_COL)
+            .expect("query_index must exist")
+            .0;
+        let dist_pos = schema
+            .column_with_name(DIST_COL)
+            .expect("distance must exist")
+            .0;
+        assert_eq!(
+            stats.column_statistics[query_index_pos],
+            ColumnStatistics::default(),
+        );
+        assert_eq!(
+            stats.column_statistics[dist_pos].null_count,
+            stats.column_statistics[schema.column_with_name("i").unwrap().0].null_count,
+            "distance null-count should be derived from vector/input nullability and remain aligned"
+        );
+    }
+
+    #[test]
+    fn test_remove_vector_from_schema_nested_path() {
+        let payload_field = ArrowField::new(
+            "payload",
+            DataType::Struct(
+                vec![
+                    ArrowField::new(
+                        "vec",
+                        DataType::FixedSizeList(
+                            Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                            4,
+                        ),
+                        true,
+                    ),
+                    ArrowField::new("tag", DataType::Utf8, true),
+                ]
+                .into(),
+            ),
+            true,
+        );
+        let schema = ArrowSchema::new(vec![
+            ArrowField::new("i", DataType::Int32, true),
+            payload_field,
+            ROW_ID_FIELD.clone(),
+        ]);
+        let without_vec =
+            KNNVectorDistanceExec::remove_vector_from_schema(&schema, "payload.vec").unwrap();
+        let payload = without_vec.field_with_name("payload").unwrap();
+        let DataType::Struct(children) = payload.data_type() else {
+            panic!("payload should remain struct");
+        };
+        assert!(children.iter().all(|f| f.name() != "vec"));
+        assert!(children.iter().any(|f| f.name() == "tag"));
+    }
+
+    #[test]
+    fn test_take_vector_row_copies_single_row() {
+        let vectors = FixedSizeListArray::try_new_from_values(
+            Float32Array::from((0..12).map(|v| v as f32).collect::<Vec<_>>()),
+            4,
+        )
+        .unwrap();
+        let row = KNNVectorDistanceExec::take_vector_row(&vectors, 2).unwrap();
+        assert_eq!(row.len(), 1);
+        assert_eq!(
+            row.to_data().offset(),
+            0,
+            "take/copy should not retain row offset into the full input buffer"
+        );
+    }
+
+    #[test]
+    fn test_resolve_vector_column_supports_escaped_nested_path() {
+        let vec_field = ArrowField::new(
+            "vec.with.dot",
+            DataType::FixedSizeList(
+                Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                4,
+            ),
+            true,
+        );
+        let payload_field = ArrowField::new(
+            "payload",
+            DataType::Struct(vec![vec_field.clone()].into()),
+            true,
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![payload_field]));
+        let vectors = FixedSizeListArray::try_new_from_values(
+            Float32Array::from((0..8).map(|v| v as f32).collect::<Vec<_>>()),
+            4,
+        )
+        .unwrap();
+        let payload = StructArray::from(vec![(Arc::new(vec_field), Arc::new(vectors) as ArrayRef)]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(payload)]).unwrap();
+        let vector =
+            KNNVectorDistanceExec::resolve_vector_column(&batch, "payload.`vec.with.dot`").unwrap();
+        assert_eq!(vector.len(), 2);
+    }
+
+    #[test]
+    fn test_remove_vector_from_batch_nested_keeps_siblings() {
+        let vec_field = ArrowField::new(
+            "vec.with.dot",
+            DataType::FixedSizeList(
+                Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                4,
+            ),
+            true,
+        );
+        let tag_field = ArrowField::new("tag", DataType::Utf8, true);
+        let payload_field = ArrowField::new(
+            "payload",
+            DataType::Struct(vec![vec_field.clone(), tag_field.clone()].into()),
+            true,
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![payload_field]));
+        let vectors = FixedSizeListArray::try_new_from_values(
+            Float32Array::from((0..8).map(|v| v as f32).collect::<Vec<_>>()),
+            4,
+        )
+        .unwrap();
+        let tags = StringArray::from(vec!["a", "b"]);
+        let payload = StructArray::from(vec![
+            (Arc::new(vec_field), Arc::new(vectors) as ArrayRef),
+            (Arc::new(tag_field), Arc::new(tags) as ArrayRef),
+        ]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(payload)]).unwrap();
+
+        let slim =
+            KNNVectorDistanceExec::remove_vector_from_batch(&batch, "payload.`vec.with.dot`")
+                .unwrap();
+        let payload = slim.column_by_name("payload").unwrap().as_struct();
+        assert!(payload.column_by_name("vec.with.dot").is_none());
+        assert!(payload.column_by_name("tag").is_some());
+    }
+
+    #[test]
+    fn test_assemble_batch_output_retained_nested_vector_keeps_sibling_values() {
+        let vec_field = ArrowField::new(
+            "vec",
+            DataType::FixedSizeList(
+                Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                4,
+            ),
+            true,
+        );
+        let tag_field = ArrowField::new("tag", DataType::Utf8, true);
+        let payload_field = ArrowField::new(
+            "payload",
+            DataType::Struct(vec![vec_field.clone(), tag_field.clone()].into()),
+            true,
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![payload_field, ROW_ID_FIELD.clone()]));
+        let vectors = FixedSizeListArray::try_new_from_values(
+            Float32Array::from((0..12).map(|v| v as f32).collect::<Vec<_>>()),
+            4,
+        )
+        .unwrap();
+        let tags = StringArray::from(vec!["a", "b", "c"]);
+        let payload = StructArray::from(vec![
+            (Arc::new(vec_field), Arc::new(vectors) as ArrayRef),
+            (Arc::new(tag_field), Arc::new(tags) as ArrayRef),
+        ]);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(payload) as ArrayRef,
+                Arc::new(UInt64Array::from(vec![10, 11, 12])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let slim_batch = Arc::new(
+            KNNVectorDistanceExec::remove_vector_from_batch(&batch, "payload.vec").unwrap(),
+        );
+        let vectors = KNNVectorDistanceExec::resolve_vector_column(&batch, "payload.vec").unwrap();
+        let results = [2, 0]
+            .into_iter()
+            .map(|row_index| BatchKnnCandidate {
+                query_index: 0,
+                distance: row_index as f32,
+                row_id: 10 + row_index as u64,
+                extra: BatchKnnExtra::WithSlimBatch {
+                    slim_batch: Arc::clone(&slim_batch),
+                    row_index,
+                    vector_row: Some(
+                        KNNVectorDistanceExec::take_vector_row(vectors.as_ref(), row_index)
+                            .unwrap(),
+                    ),
+                },
+            })
+            .collect::<Vec<_>>();
+
+        let output = KNNVectorDistanceExec::assemble_batch_output(
+            &results,
+            schema.as_ref(),
+            "payload.vec",
+            true,
+        )
+        .unwrap();
+
+        let payload = output.column_by_name("payload").unwrap().as_struct();
+        let tags = payload.column_by_name("tag").unwrap().as_string::<i32>();
+        assert!(tags.is_valid(0));
+        assert!(tags.is_valid(1));
+        assert_eq!(tags.value(0), "c");
+        assert_eq!(tags.value(1), "a");
+        let vectors = payload.column_by_name("vec").unwrap();
+        assert_eq!(vectors.len(), 2);
+    }
+
     #[tokio::test]
     async fn test_multivector_score() {
         let query = Query {
@@ -2647,6 +3412,7 @@ mod tests {
             use_index: true,
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
+            approx_mode: Default::default(),
         };
 
         async fn multivector_scoring(
@@ -2869,6 +3635,128 @@ mod tests {
             assert!(*stats.all_counts.get(PARTITIONS_SEARCHED_METRIC).unwrap() < 100 * num_deltas);
         }
         assert_find_partitions_elapsed_recorded(&stats);
+    }
+
+    /// The ANN operators report the exact index-file I/O performed for a query
+    /// (bytes_read / iops), measured only on cache misses.  A cold search loads
+    /// partitions from storage and reports non-zero I/O; an immediately
+    /// following warm search serves every partition from the index cache and
+    /// reports zero -- which is the cache-effectiveness signal the metric adds.
+    #[tokio::test]
+    async fn test_io_metrics_cold_vs_warm() {
+        let fixture = NprobesTestFixture::new(100, 1).await;
+        let q = fixture.get_centroid(0);
+
+        let run = |holder: &StatsHolder| {
+            let setter = holder.get_setter();
+            async {
+                fixture
+                    .dataset
+                    .scan()
+                    .nearest("vector", q.as_ref(), 10)
+                    .unwrap()
+                    .minimum_nprobes(10)
+                    .scan_stats_callback(setter)
+                    .project(&Vec::<String>::new())
+                    .unwrap()
+                    .with_row_id()
+                    .try_into_batch()
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // Cold: a freshly opened dataset has an empty index cache, so the
+        // sub-index search must read partitions (and their quantization storage)
+        // from disk.  Those reads flow through the per-query I/O sink.
+        let cold_holder = StatsHolder::default();
+        run(&cold_holder).await;
+        let cold = cold_holder.consume();
+        assert!(
+            cold.parts_loaded > 0,
+            "cold search should load partitions, got parts_loaded={}",
+            cold.parts_loaded
+        );
+        assert!(
+            cold.bytes_read > 0,
+            "cold search should report index-file I/O, got bytes_read={}",
+            cold.bytes_read
+        );
+        assert!(
+            cold.iops > 0,
+            "cold search should report index-file IOPS, got iops={}",
+            cold.iops
+        );
+
+        // Warm: the same query on the same dataset finds every partition it
+        // needs already cached, so no index-file I/O is performed.
+        let warm_holder = StatsHolder::default();
+        run(&warm_holder).await;
+        let warm = warm_holder.consume();
+        assert_eq!(
+            warm.parts_loaded, 0,
+            "warm search should not reload partitions, got parts_loaded={}",
+            warm.parts_loaded
+        );
+        assert_eq!(
+            warm.bytes_read, 0,
+            "warm search should report no index-file I/O, got bytes_read={}",
+            warm.bytes_read
+        );
+    }
+
+    /// The new I/O metrics must actually surface in `EXPLAIN ANALYZE` text on
+    /// the ANN operators: non-zero on a cold query (partition reads on
+    /// `ANNSubIndex`, index-open reads on `ANNIvfPartition`) and zero on a warm
+    /// query (everything served from the index cache).
+    #[tokio::test]
+    async fn test_io_metrics_visible_in_explain_analyze() {
+        // Returns the value of `metric=` from the analyzed-plan line for `node`.
+        fn node_metric<'a>(plan: &'a str, node: &str, metric: &str) -> &'a str {
+            let line = plan
+                .lines()
+                .find(|l| l.trim_start().starts_with(node))
+                .unwrap_or_else(|| panic!("plan missing node {node}:\n{plan}"));
+            let after = line
+                .split_once(&format!("{metric}="))
+                .unwrap_or_else(|| panic!("node {node} line missing {metric}=:\n{line}"))
+                .1;
+            after.split([',', ']']).next().unwrap().trim()
+        }
+
+        let fixture = NprobesTestFixture::new(100, 1).await;
+        let q = fixture.get_centroid(0);
+
+        // Cold: a freshly opened dataset must show real index-file I/O.
+        let cold = fixture
+            .dataset
+            .scan()
+            .nearest("vector", q.as_ref(), 10)
+            .unwrap()
+            .minimum_nprobes(10)
+            .analyze_plan()
+            .await
+            .unwrap();
+        // Sub-index partition reads.
+        assert_ne!(node_metric(&cold, "ANNSubIndex", "bytes_read"), "0");
+        assert_ne!(node_metric(&cold, "ANNSubIndex", "iops"), "0");
+        // Index-open reads (centroids/metadata) now attributed to the partition
+        // operator -- the value this part of the change adds.
+        assert_ne!(node_metric(&cold, "ANNIvfPartition", "bytes_read"), "0");
+        assert_ne!(node_metric(&cold, "ANNIvfPartition", "iops"), "0");
+
+        // Warm: same query, everything cache-resident -> zero index-file I/O.
+        let warm = fixture
+            .dataset
+            .scan()
+            .nearest("vector", q.as_ref(), 10)
+            .unwrap()
+            .minimum_nprobes(10)
+            .analyze_plan()
+            .await
+            .unwrap();
+        assert_eq!(node_metric(&warm, "ANNSubIndex", "bytes_read"), "0");
+        assert_eq!(node_metric(&warm, "ANNIvfPartition", "bytes_read"), "0");
     }
 
     #[rstest]

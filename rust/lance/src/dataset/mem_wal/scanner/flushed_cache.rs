@@ -22,7 +22,9 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use lance_core::{Error, Result};
+use lance_io::object_store::ObjectStoreParams;
 
 use crate::dataset::{Dataset, DatasetBuilder};
 use crate::session::Session;
@@ -38,15 +40,22 @@ use crate::session::Session;
 /// The key is the resolved absolute flushed path
 /// (`{base}/_mem_wal/{shard}/{folder}`), which is globally unique, so a single
 /// cache can safely span multiple tables.
+///
+/// `store_params` is deliberately *not* part of the key: the first caller to
+/// open a path binds the store that every later hit reuses. Credential rotation
+/// still works — a vended-credential store holds the live
+/// `StorageOptionsAccessor` and re-resolves per request, so a cached handle
+/// never carries expired credentials. What this does assume is that a given
+/// path is only ever served under one store configuration. Serving one table
+/// through a single cache under two different `ObjectStoreParams` would hand
+/// every caller the store the first one opened with.
 pub struct FlushedMemTableCache {
     // `moka`'s async cache gives a bounded size plus single-flight
     // `try_get_with`, so concurrent first-queries on a just-flushed
-    // generation open the dataset exactly once.
+    // generation open the dataset exactly once. The opened dataset carries the
+    // session index cache, which also backs each generation's standalone PK
+    // dedup index (see `block_list::open_pk_index`) — no separate cache path.
     inner: moka::future::Cache<String, Arc<Dataset>>,
-    // Per-generation set of PK hashes for the vector-search block-list, keyed by
-    // the same immutable flushed path. Built lazily on the first query that needs
-    // it (single-flight) so repeated searches skip re-scanning the PK column.
-    pk_hashes: moka::future::Cache<String, Arc<HashSet<u64>>>,
 }
 
 impl FlushedMemTableCache {
@@ -63,24 +72,18 @@ impl FlushedMemTableCache {
                 // into at build time.
                 .support_invalidation_closures()
                 .build(),
-            pk_hashes: moka::future::Cache::builder()
-                .max_capacity(max_entries)
-                .support_invalidation_closures()
-                .build(),
         }
     }
 
     /// Get the dataset for `path`, opening it (exactly once) on a miss.
-    ///
-    /// `session` is threaded into the open so the first open populates the
-    /// shared index / file-metadata caches; subsequent hits are a pure
-    /// `Arc::clone` with zero object-store I/O. Concurrent callers for the
-    /// same path share a single open via `moka`'s single-flight
-    /// `try_get_with`.
+    /// Concurrent callers share a single open via `moka`'s single-flight
+    /// `try_get_with`; hits are a pure `Arc::clone`. `session` / `store_params`
+    /// configure the open.
     pub async fn get_or_open(
         &self,
         path: &str,
         session: Option<Arc<Session>>,
+        store_params: Option<ObjectStoreParams>,
     ) -> Result<Arc<Dataset>> {
         self.inner
             .try_get_with(path.to_string(), async move {
@@ -88,26 +91,14 @@ impl FlushedMemTableCache {
                 if let Some(session) = session {
                     builder = builder.with_session(session);
                 }
+                if let Some(store_params) = store_params {
+                    builder = builder.with_store_params(store_params);
+                }
                 builder.load().await.map(Arc::new)
             })
             .await
             // `try_get_with` hands losing racers an `Arc<Error>`; the original
             // error keeps full context, clones collapse to `Error::Cloned`.
-            .map_err(|e: Arc<Error>| Error::cloned(e.to_string()))
-    }
-
-    /// Get the cached set of PK hashes for `path`, building it (exactly once) on
-    /// a miss via `build`. The flushed path is immutable, so a cached set is
-    /// never stale; concurrent first-queries share one build via `moka`'s
-    /// single-flight `try_get_with`.
-    pub async fn get_or_build_pk_hashes(
-        &self,
-        path: &str,
-        build: impl std::future::Future<Output = Result<HashSet<u64>>>,
-    ) -> Result<Arc<HashSet<u64>>> {
-        self.pk_hashes
-            .try_get_with(path.to_string(), async move { build.await.map(Arc::new) })
-            .await
             .map_err(|e: Arc<Error>| Error::cloned(e.to_string()))
     }
 
@@ -125,10 +116,6 @@ impl FlushedMemTableCache {
         let _ = self
             .inner
             .invalidate_entries_if(move |path, _| !live.contains(path));
-        let live = live_paths.clone();
-        let _ = self
-            .pk_hashes
-            .invalidate_entries_if(move |path, _| !live.contains(path));
     }
 }
 
@@ -140,29 +127,110 @@ impl std::fmt::Debug for FlushedMemTableCache {
     }
 }
 
+/// Caching of opened flushed-generation datasets, keyed by immutable path. The
+/// opened dataset carries the session index cache, which also backs each
+/// generation's secondary indexes and its PK dedup sidecar (see
+/// `block_list::open_pk_index`) — so a single `get_or_open` is the
+/// whole caching surface. Implemented by [`FlushedMemTableCache`]; a
+/// [`GenerationWarmer`] composes one to warm through it, and a consumer may
+/// supply its own implementation.
+#[async_trait]
+pub trait DatasetCache: Send + Sync + std::fmt::Debug {
+    async fn get_or_open(
+        &self,
+        path: &str,
+        session: Option<Arc<Session>>,
+        store_params: Option<ObjectStoreParams>,
+    ) -> Result<Arc<Dataset>>;
+
+    /// Drop cached entries whose path is not in `live_paths`. Async so an
+    /// implementation can evict retired generations' index objects (e.g.
+    /// `Session::invalidate_index_prefix`) without a later breaking signature
+    /// change; [`FlushedMemTableCache`]'s own eviction is synchronous.
+    async fn retain_paths(&self, live_paths: &HashSet<String>);
+}
+
+#[async_trait]
+impl DatasetCache for FlushedMemTableCache {
+    async fn get_or_open(
+        &self,
+        path: &str,
+        session: Option<Arc<Session>>,
+        store_params: Option<ObjectStoreParams>,
+    ) -> Result<Arc<Dataset>> {
+        Self::get_or_open(self, path, session, store_params).await
+    }
+
+    async fn retain_paths(&self, live_paths: &HashSet<String>) {
+        Self::retain_paths(self, live_paths)
+    }
+}
+
+/// Proactively warms a flushed generation into the shared caches: open the
+/// dataset and pre-load its secondary indexes and PK dedup sidecar so the first
+/// query sees no cold reads. This is the **seam** the flush and read paths fire
+/// — lance defines it; the consumer (e.g. the WAL pod) implements it. `None` =>
+/// no warming, generations warm lazily on first read.
+///
+/// Everything a warmer touches is keyed by the immutable generation `path`
+/// (opened dataset, its secondary indexes, its PK dedup sidecar), so `path` is
+/// the only input it needs.
+///
+/// `warm` is fired fire-and-forget from every read path that opens a generation
+/// (all four LSM planners) as well as pre-commit on flush, so the same path may
+/// be warmed concurrently and repeatedly. Implementations **must be idempotent
+/// and cheap when the path is already warm** (e.g. dedup in-flight and
+/// completed paths) — a redundant call must not re-do work or fail.
+#[async_trait]
+pub trait GenerationWarmer: Send + Sync + std::fmt::Debug {
+    async fn warm(&self, path: &str) -> Result<()>;
+}
+
 /// Open a flushed-generation dataset, shared by all three LSM open sites
 /// (scan, point lookup, vector search).
 ///
-/// - `cache` present: route through [`FlushedMemTableCache`] (single-flight,
-///   shared `Arc`, manifest read amortized across queries).
+/// - `cache` present: route through a [`DatasetCache`] (e.g.
+///   [`FlushedMemTableCache`]: single-flight, shared `Arc`, manifest read
+///   amortized across queries).
 /// - `cache` absent: cold open via [`DatasetBuilder`]. Passing `session`
 ///   still reuses the shared index / metadata caches; `None`/`None`
 ///   reproduces the original per-query cold-open behavior exactly.
-pub(super) async fn open_flushed_dataset(
+/// - `warmer` present: fire a fire-and-forget warm-on-open backstop behind the
+///   returned handle (the warmer dedups already-warm paths). `None` => no warming.
+pub async fn open_flushed_dataset(
     path: &str,
     session: Option<&Arc<Session>>,
-    cache: Option<&Arc<FlushedMemTableCache>>,
+    store_params: Option<&ObjectStoreParams>,
+    cache: Option<&Arc<dyn DatasetCache>>,
+    warmer: Option<&Arc<dyn GenerationWarmer>>,
 ) -> Result<Arc<Dataset>> {
-    match cache {
-        Some(cache) => cache.get_or_open(path, session.cloned()).await,
+    let dataset = match cache {
+        Some(cache) => {
+            cache
+                .get_or_open(path, session.cloned(), store_params.cloned())
+                .await?
+        }
         None => {
             let mut builder = DatasetBuilder::from_uri(path);
             if let Some(session) = session {
                 builder = builder.with_session(session.clone());
             }
-            Ok(Arc::new(builder.load().await?))
+            if let Some(store_params) = store_params {
+                builder = builder.with_store_params(store_params.clone());
+            }
+            Arc::new(builder.load().await?)
         }
+    };
+    if let Some(warmer) = warmer {
+        let warmer = Arc::clone(warmer);
+        let path = path.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = warmer.warm(&path).await {
+                tracing::debug!(generation = %path, error = %e, "warm-on-open failed");
+            }
+        });
     }
+    Ok(dataset)
 }
 
 #[cfg(test)]
@@ -200,8 +268,8 @@ mod tests {
         write_dataset(&uri, &[1, 2, 3]).await;
 
         let cache = FlushedMemTableCache::new(8);
-        let first = cache.get_or_open(&uri, None).await.unwrap();
-        let second = cache.get_or_open(&uri, None).await.unwrap();
+        let first = cache.get_or_open(&uri, None, None).await.unwrap();
+        let second = cache.get_or_open(&uri, None, None).await.unwrap();
 
         assert!(
             Arc::ptr_eq(&first, &second),
@@ -232,7 +300,7 @@ mod tests {
             let calls = calls.clone();
             handles.push(tokio::spawn(async move {
                 calls.fetch_add(1, Ordering::SeqCst);
-                cache.get_or_open(&uri, None).await.unwrap()
+                cache.get_or_open(&uri, None, None).await.unwrap()
             }));
         }
 
@@ -251,34 +319,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pk_hashes_cached_reuses_first_build() {
-        // The PK-hash set is keyed by the immutable flushed path: a hit returns
-        // the first-built set and never runs the second build closure.
-        let cache = FlushedMemTableCache::new(8);
-        let path = "memory://shard/gen_1";
-        let first = cache
-            .get_or_build_pk_hashes(path, async { Ok(HashSet::from([1u64, 2])) })
-            .await
-            .unwrap();
-        let second = cache
-            .get_or_build_pk_hashes(path, async {
-                // Different contents; must be ignored because the path is cached.
-                Ok(HashSet::from([9u64]))
-            })
-            .await
-            .unwrap();
-        assert!(
-            Arc::ptr_eq(&first, &second),
-            "a PK-hash cache hit must reuse the first-built set"
-        );
-        assert_eq!(
-            second.len(),
-            2,
-            "cached set keeps the first build's contents"
-        );
-    }
-
-    #[tokio::test]
     async fn test_retain_paths_drops_unreferenced() {
         let temp_dir = tempfile::tempdir().unwrap();
         let base = temp_dir.path().to_str().unwrap();
@@ -288,8 +328,8 @@ mod tests {
         write_dataset(&drop_uri, &[2]).await;
 
         let cache = FlushedMemTableCache::new(8);
-        cache.get_or_open(&keep_uri, None).await.unwrap();
-        cache.get_or_open(&drop_uri, None).await.unwrap();
+        cache.get_or_open(&keep_uri, None, None).await.unwrap();
+        cache.get_or_open(&drop_uri, None, None).await.unwrap();
         cache.inner.run_pending_tasks().await;
         assert_eq!(cache.inner.entry_count(), 2);
 
@@ -310,8 +350,12 @@ mod tests {
         let uri = format!("{}/gen_1", temp_dir.path().to_str().unwrap());
         write_dataset(&uri, &[7, 8, 9]).await;
 
-        let a = open_flushed_dataset(&uri, None, None).await.unwrap();
-        let b = open_flushed_dataset(&uri, None, None).await.unwrap();
+        let a = open_flushed_dataset(&uri, None, None, None, None)
+            .await
+            .unwrap();
+        let b = open_flushed_dataset(&uri, None, None, None, None)
+            .await
+            .unwrap();
         assert!(
             !Arc::ptr_eq(&a, &b),
             "no-cache path must cold-open each call"
@@ -319,13 +363,57 @@ mod tests {
         assert_eq!(a.count_rows(None).await.unwrap(), 3);
 
         // With a cache, the second call is a shared clone.
-        let cache = Arc::new(FlushedMemTableCache::new(8));
-        let c = open_flushed_dataset(&uri, None, Some(&cache))
+        let cache: Arc<dyn DatasetCache> = Arc::new(FlushedMemTableCache::new(8));
+        let c = open_flushed_dataset(&uri, None, None, Some(&cache), None)
             .await
             .unwrap();
-        let d = open_flushed_dataset(&uri, None, Some(&cache))
+        let d = open_flushed_dataset(&uri, None, None, Some(&cache), None)
             .await
             .unwrap();
         assert!(Arc::ptr_eq(&c, &d), "cached path must reuse the Arc");
+    }
+
+    /// A warmer that records calls and signals each one.
+    #[derive(Debug)]
+    struct NotifyingWarmer {
+        calls: Arc<AtomicUsize>,
+        notify: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl GenerationWarmer for NotifyingWarmer {
+        async fn warm(&self, _path: &str) -> Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.notify.notify_one();
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_open_flushed_dataset_fires_warm_on_open() {
+        // The warm-on-open backstop fires the warmer (fire-and-forget) when a
+        // generation is opened, so generations the flusher never warmed still
+        // get warmed lazily on first read.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let uri = format!("{}/gen_1", temp_dir.path().to_str().unwrap());
+        write_dataset(&uri, &[1, 2, 3]).await;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let warmer: Arc<dyn GenerationWarmer> = Arc::new(NotifyingWarmer {
+            calls: calls.clone(),
+            notify: notify.clone(),
+        });
+
+        let ds = open_flushed_dataset(&uri, None, None, None, Some(&warmer))
+            .await
+            .unwrap();
+        assert_eq!(ds.count_rows(None).await.unwrap(), 3);
+
+        // The warm is spawned fire-and-forget; wait (bounded) for it to run.
+        tokio::time::timeout(std::time::Duration::from_secs(5), notify.notified())
+            .await
+            .expect("warm-on-open must fire");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "warmer fired once on open");
     }
 }

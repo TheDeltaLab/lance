@@ -47,10 +47,14 @@
 
 pub mod backend;
 pub mod codec;
+mod entry_io;
 mod moka;
 
-pub use backend::{CacheBackend, CacheEntry, InternalCacheKey};
-pub use codec::{CacheCodec, CacheCodecImpl};
+pub use backend::{CacheBackend, CacheEntry, CacheKeyIterator, InternalCacheKey};
+pub use codec::{
+    CacheCodec, CacheCodecImpl, CacheDecode, CacheMissReason, MAGIC, has_cache_envelope,
+};
+pub use entry_io::{CacheEntryReader, CacheEntryWriter};
 pub use moka::MokaCacheBackend;
 
 use std::borrow::Cow;
@@ -61,9 +65,9 @@ use std::sync::{
 
 use futures::{Future, FutureExt};
 
-use crate::{Result, utils::tracing::FutureTracingExt};
+use crate::Result;
 
-pub use deepsize::{Context, DeepSizeOf};
+pub use crate::deepsize::{Context, DeepSizeOf};
 
 // ---------------------------------------------------------------------------
 // CacheKey / UnsizedCacheKey — typed key traits for cache users
@@ -245,6 +249,40 @@ impl LanceCache {
         self.cache.size_bytes().await
     }
 
+    /// Return an iterator over keys currently stored under this cache's prefix.
+    ///
+    /// Returns `None` when the backend does not support key inventory. The
+    /// iterator is intended for diagnostics and may be weakly consistent with
+    /// concurrent cache mutations.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::{borrow::Cow, sync::Arc};
+    /// # use lance_core::cache::{CacheKey, LanceCache};
+    /// # struct MyKey;
+    /// # impl CacheKey for MyKey {
+    /// #     type ValueType = Vec<i32>;
+    /// #     fn key(&self) -> Cow<'_, str> { Cow::Borrowed("my-key") }
+    /// #     fn type_name() -> &'static str { "VecI32" }
+    /// # }
+    /// # async fn example() {
+    /// let cache = LanceCache::with_capacity(1024);
+    /// cache.insert_with_key(&MyKey, Arc::new(vec![1, 2, 3])).await;
+    ///
+    /// let mut keys = cache.keys().await.expect("Moka supports key inventory");
+    /// assert_eq!(keys.next().unwrap().key(), "my-key");
+    /// # }
+    /// ```
+    pub async fn keys(&self) -> Option<CacheKeyIterator<'_>> {
+        Some(Box::new(
+            self.cache
+                .keys()
+                .await?
+                .filter(|key| key.starts_with(&self.prefix)),
+        ))
+    }
+
     // -- Sized insert/get (internal, shared by sized and unsized paths) --------
 
     async fn insert_with_id<T: DeepSizeOf + Send + Sync + 'static>(
@@ -338,15 +376,12 @@ impl LanceCache {
     {
         let key = build_key(&self.prefix, &cache_key.key(), K::type_name());
 
-        let typed_loader = Box::pin(
-            async move {
-                let value = loader().await?;
-                let arc = Arc::new(value);
-                let size = cache_entry_size(&*arc);
-                Ok((arc as CacheEntry, size))
-            }
-            .future_in_current_span(),
-        );
+        let typed_loader = Box::pin(async move {
+            let value = loader().await?;
+            let arc = Arc::new(value);
+            let size = cache_entry_size(&*arc);
+            Ok((arc as CacheEntry, size))
+        });
 
         let (entry, was_cached) = self
             .cache
@@ -471,15 +506,12 @@ impl WeakLanceCache {
     {
         if let Some(cache) = self.inner.upgrade() {
             let key = build_key(&self.prefix, &cache_key.key(), K::type_name());
-            let typed_loader = Box::pin(
-                async move {
-                    let value = loader().await?;
-                    let arc = Arc::new(value);
-                    let size = cache_entry_size(&*arc);
-                    Ok((arc as CacheEntry, size))
-                }
-                .future_in_current_span(),
-            );
+            let typed_loader = Box::pin(async move {
+                let value = loader().await?;
+                let arc = Arc::new(value);
+                let size = cache_entry_size(&*arc);
+                Ok((arc as CacheEntry, size))
+            });
             let (entry, was_cached) = cache.get_or_insert(&key, typed_loader, K::codec()).await?;
             if was_cached {
                 self.hits.fetch_add(1, Ordering::Relaxed);
@@ -563,8 +595,10 @@ impl CacheStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use crate::Error;
+    use std::collections::{BTreeSet, HashMap};
     use std::marker::PhantomData;
+    use std::sync::atomic::AtomicUsize;
 
     struct TestKey<T: 'static> {
         key: String,
@@ -615,6 +649,18 @@ mod tests {
         }
     }
 
+    fn key_fields(keys: &[InternalCacheKey]) -> BTreeSet<(String, String, &'static str)> {
+        keys.iter()
+            .map(|key| {
+                (
+                    key.prefix().to_string(),
+                    key.key().to_string(),
+                    key.type_name(),
+                )
+            })
+            .collect()
+    }
+
     #[tokio::test]
     async fn test_cache_bytes() {
         let item = Arc::new(vec![1, 2, 3]);
@@ -642,6 +688,39 @@ mod tests {
                 .await;
         }
         assert!(cache.size_bytes().await <= capacity);
+    }
+
+    #[tokio::test]
+    async fn test_cache_weighs_key_footprint() {
+        // Weighted size charges the key's unique bytes, not just the value.
+        let cache = LanceCache::with_capacity(usize::MAX);
+        let key = "k".repeat(10_000);
+        let value = Arc::new(vec![1_i32]);
+        let expected =
+            std::mem::size_of::<InternalCacheKey>() + key.len() + cache_entry_size(&*value);
+        cache
+            .insert_with_key(&TestKey::<Vec<i32>>::new(&key), value)
+            .await;
+        assert_eq!(cache.size_bytes().await, expected);
+    }
+
+    #[tokio::test]
+    async fn test_cache_shared_prefix_not_charged_per_entry() {
+        // The shared prefix contributes nothing per entry (it isn't freed on a
+        // single eviction); only struct + unique key + value are charged.
+        let cache = LanceCache::with_capacity(usize::MAX).with_key_prefix(&"p".repeat(10_000));
+        for i in 0..100 {
+            cache
+                .insert_with_key(
+                    &TestKey::<Vec<i32>>::new(&i.to_string()),
+                    Arc::new(vec![1_i32]),
+                )
+                .await;
+        }
+        let value_cost = cache_entry_size(&vec![1_i32]);
+        let key_bytes: usize = (0..100).map(|i| i.to_string().len()).sum();
+        let expected = 100 * (std::mem::size_of::<InternalCacheKey>() + value_cost) + key_bytes;
+        assert_eq!(cache.size_bytes().await, expected);
     }
 
     #[tokio::test]
@@ -725,6 +804,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cache_keys_with_prefixes() {
+        let base = LanceCache::with_capacity(1000);
+        let prefixed = base.with_key_prefix("ns");
+        let nested = prefixed.with_key_prefix("index");
+        let other = base.with_key_prefix("ns-other");
+
+        base.insert_with_key(&TestKey::new("root"), Arc::new(vec![0]))
+            .await;
+        prefixed
+            .insert_with_key(&TestKey::new("child"), Arc::new(vec![1]))
+            .await;
+        nested
+            .insert_with_key(&TestKey::new("nested"), Arc::new(vec![2]))
+            .await;
+        other
+            .insert_with_key(&TestKey::new("other"), Arc::new(vec![3]))
+            .await;
+
+        let base_keys = base.keys().await.unwrap().collect::<Vec<_>>();
+        assert_eq!(
+            key_fields(&base_keys),
+            BTreeSet::from([
+                (
+                    "".to_string(),
+                    "root".to_string(),
+                    TestKey::<Vec<i32>>::type_name()
+                ),
+                (
+                    "ns/".to_string(),
+                    "child".to_string(),
+                    TestKey::<Vec<i32>>::type_name()
+                ),
+                (
+                    "ns/index/".to_string(),
+                    "nested".to_string(),
+                    TestKey::<Vec<i32>>::type_name()
+                ),
+                (
+                    "ns-other/".to_string(),
+                    "other".to_string(),
+                    TestKey::<Vec<i32>>::type_name()
+                ),
+            ])
+        );
+
+        let prefixed_keys = prefixed.keys().await.unwrap().collect::<Vec<_>>();
+        assert_eq!(
+            key_fields(&prefixed_keys),
+            BTreeSet::from([
+                (
+                    "ns/".to_string(),
+                    "child".to_string(),
+                    TestKey::<Vec<i32>>::type_name()
+                ),
+                (
+                    "ns/index/".to_string(),
+                    "nested".to_string(),
+                    TestKey::<Vec<i32>>::type_name()
+                ),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cache_keys_reflect_invalidation_and_clear() {
+        let base = LanceCache::with_capacity(1000);
+        let prefixed = base.with_key_prefix("ns");
+        let other = base.with_key_prefix("other");
+
+        prefixed
+            .insert_with_key(&TestKey::new("child"), Arc::new(vec![1]))
+            .await;
+        other
+            .insert_with_key(&TestKey::new("other"), Arc::new(vec![2]))
+            .await;
+        assert_eq!(base.keys().await.unwrap().count(), 2);
+
+        prefixed.invalidate_prefix("").await;
+        let keys = base.keys().await.unwrap().collect::<Vec<_>>();
+        assert_eq!(
+            key_fields(&keys),
+            BTreeSet::from([(
+                "other/".to_string(),
+                "other".to_string(),
+                TestKey::<Vec<i32>>::type_name()
+            )])
+        );
+
+        base.clear().await;
+        assert_eq!(base.keys().await.unwrap().count(), 0);
+    }
+
+    #[tokio::test]
     async fn test_cache_get_or_insert() {
         let cache = LanceCache::with_capacity(1000);
 
@@ -747,6 +919,37 @@ mod tests {
             .unwrap();
         assert_eq!(*v, vec![1, 2, 3]);
         assert_eq!(cache.stats().await.hits, 1);
+    }
+
+    #[tokio::test]
+    async fn test_cache_coalesces_concurrent_loader_errors() {
+        let cache = LanceCache::with_capacity(1000);
+        let barrier = Arc::new(tokio::sync::Barrier::new(5));
+        let loader_calls = Arc::new(AtomicUsize::new(0));
+
+        let results = futures::future::join_all((0..5).map(|_| {
+            let cache = cache.clone();
+            let barrier = barrier.clone();
+            let loader_calls = loader_calls.clone();
+            async move {
+                barrier.wait().await;
+                cache
+                    .get_or_insert_with_key(TestKey::<Vec<i32>>::new("error"), || async move {
+                        loader_calls.fetch_add(1, Ordering::Relaxed);
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        Err(Error::timeout("metadata read timed out"))
+                    })
+                    .await
+            }
+        }))
+        .await;
+
+        assert_eq!(loader_calls.load(Ordering::Relaxed), 1);
+        assert!(
+            results
+                .iter()
+                .all(|result| matches!(result, Err(Error::Timeout { .. })))
+        );
     }
 
     #[tokio::test]
@@ -839,6 +1042,7 @@ mod tests {
                 .await
                 .is_none()
         );
+        assert!(cache.keys().await.is_none());
     }
 
     #[tokio::test]

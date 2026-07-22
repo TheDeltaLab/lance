@@ -3,6 +3,7 @@
 
 use super::InvertedPartition;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 // the Scorer trait is used to calculate the score of a token in a document
 // in general, the score is calculated as:
@@ -10,11 +11,73 @@ use std::collections::HashMap;
 pub trait Scorer: Send + Sync {
     fn query_weight(&self, token: &str) -> f32;
     fn doc_weight(&self, freq: u32, doc_tokens: u32) -> f32;
+
+    /// Finite upper bound for every non-negative value returned by
+    /// [`Self::doc_weight`]. Returning `None` disables score-independent
+    /// pruning where the posting format has no stored impact bounds.
+    fn doc_weight_upper_bound(&self) -> Option<f32> {
+        None
+    }
+
+    /// Stable identity for the corpus-level inputs used by [`Self::doc_weight`].
+    ///
+    /// Implementations should return `Some` only when equal keys guarantee the
+    /// same document weight for every `(freq, doc_tokens)` pair. Scorers without
+    /// such an identity keep impact bounds in the query-local cache only.
+    fn doc_weight_cache_key(&self) -> Option<u64> {
+        None
+    }
+
+    /// The doc-length-dependent BM25 denominator addend, when `doc_weight`
+    /// factors as `(K1 + 1) * freq / (freq + addend)`; `None` for scorers
+    /// without that shape. Scoring hot loops use this to bake a per-norm-code
+    /// addend cache (Lucene's norm cache), which is bit-identical to calling
+    /// `doc_weight` because both paths evaluate the same expressions.
+    fn doc_norm(&self, doc_tokens: u32) -> Option<f32> {
+        let _ = doc_tokens;
+        None
+    }
+}
+
+impl<T: Scorer + ?Sized> Scorer for Arc<T> {
+    fn query_weight(&self, token: &str) -> f32 {
+        self.as_ref().query_weight(token)
+    }
+
+    fn doc_weight(&self, freq: u32, doc_tokens: u32) -> f32 {
+        self.as_ref().doc_weight(freq, doc_tokens)
+    }
+
+    fn doc_weight_upper_bound(&self) -> Option<f32> {
+        self.as_ref().doc_weight_upper_bound()
+    }
+
+    fn doc_weight_cache_key(&self) -> Option<u64> {
+        self.as_ref().doc_weight_cache_key()
+    }
+
+    fn doc_norm(&self, doc_tokens: u32) -> Option<f32> {
+        self.as_ref().doc_norm(doc_tokens)
+    }
+}
+
+/// The frequency-dependent half of the BM25 doc weight; `doc_norm` is the
+/// doc-length addend (from [`Scorer::doc_norm`] or a per-norm-code cache).
+#[inline]
+pub(super) fn bm25_doc_weight_with_norm(freq: u32, doc_norm: f32) -> f32 {
+    let freq = freq as f32;
+    (K1 + 1.0) * freq / (freq + doc_norm)
 }
 
 // BM25 parameters
 pub const K1: f32 = 1.2;
 pub const B: f32 = 0.75;
+
+#[inline]
+fn bm25_doc_norm(doc_tokens: u32, avg_doc_length: f32) -> f32 {
+    let doc_tokens = doc_tokens as f32;
+    K1 * (1.0 - B + B * doc_tokens / avg_doc_length)
+}
 
 #[derive(Debug, Clone)]
 pub struct MemBM25Scorer {
@@ -77,43 +140,54 @@ impl Scorer for MemBM25Scorer {
     }
 
     fn doc_weight(&self, freq: u32, doc_tokens: u32) -> f32 {
-        let freq = freq as f32;
-        let doc_tokens = doc_tokens as f32;
-        let doc_norm = K1 * (1.0 - B + B * doc_tokens / self.avg_doc_length());
-        (K1 + 1.0) * freq / (freq + doc_norm)
+        let doc_norm = bm25_doc_norm(doc_tokens, self.avg_doc_length());
+        bm25_doc_weight_with_norm(freq, doc_norm)
+    }
+
+    fn doc_norm(&self, doc_tokens: u32) -> Option<f32> {
+        Some(bm25_doc_norm(doc_tokens, self.avg_doc_length()))
+    }
+
+    fn doc_weight_upper_bound(&self) -> Option<f32> {
+        Some(K1 + 1.0)
+    }
+
+    fn doc_weight_cache_key(&self) -> Option<u64> {
+        Some(u64::from(self.avg_doc_length().to_bits()))
     }
 }
 
 pub struct IndexBM25Scorer<'a> {
     partitions: Vec<&'a InvertedPartition>,
     num_docs: usize,
-    total_tokens: u64,
     avg_doc_length: f32,
 }
 
 impl<'a> IndexBM25Scorer<'a> {
+    /// Sync constructor. Reads each partition's cached `total_tokens` via
+    /// `LazyDocSet::total_tokens_cached()`; callers must have already
+    /// populated it (via `ensure_loaded`, `ensure_num_tokens_loaded`, or
+    /// `total_tokens_num`). Panics with a clear message otherwise — this
+    /// is the wand-scoring path where the contract is statically known.
     pub fn new(partitions: impl Iterator<Item = &'a InvertedPartition>) -> Self {
         let partitions = partitions.collect::<Vec<_>>();
         let num_docs = partitions.iter().map(|p| p.docs.len()).sum();
-        let total_tokens = partitions
+        let total_tokens: u64 = partitions
             .iter()
-            .map(|part| part.docs.total_tokens_num())
-            .sum::<u64>();
+            .map(|p| {
+                p.docs.total_tokens_cached().expect(
+                    "IndexBM25Scorer::new requires each partition's total_tokens to be \
+                     cached; call `ensure_loaded` / `ensure_num_tokens_loaded` / \
+                     `total_tokens_num` first",
+                )
+            })
+            .sum();
         let avgdl = total_tokens as f32 / num_docs as f32;
         Self {
             partitions,
             num_docs,
-            total_tokens,
             avg_doc_length: avgdl,
         }
-    }
-
-    pub fn num_docs(&self) -> usize {
-        self.num_docs
-    }
-
-    pub fn total_tokens(&self) -> u64 {
-        self.total_tokens
     }
 
     pub fn num_docs_containing_token(&self, token: &str) -> usize {
@@ -140,10 +214,20 @@ impl Scorer for IndexBM25Scorer<'_> {
     }
 
     fn doc_weight(&self, freq: u32, doc_tokens: u32) -> f32 {
-        let freq = freq as f32;
-        let doc_tokens = doc_tokens as f32;
-        let doc_norm = K1 * (1.0 - B + B * doc_tokens / self.avg_doc_length);
-        (K1 + 1.0) * freq / (freq + doc_norm)
+        let doc_norm = bm25_doc_norm(doc_tokens, self.avg_doc_length);
+        bm25_doc_weight_with_norm(freq, doc_norm)
+    }
+
+    fn doc_norm(&self, doc_tokens: u32) -> Option<f32> {
+        Some(bm25_doc_norm(doc_tokens, self.avg_doc_length))
+    }
+
+    fn doc_weight_upper_bound(&self) -> Option<f32> {
+        Some(K1 + 1.0)
+    }
+
+    fn doc_weight_cache_key(&self) -> Option<u64> {
+        Some(u64::from(self.avg_doc_length.to_bits()))
     }
 }
 

@@ -6,15 +6,17 @@ use std::sync::Arc;
 use std::vec;
 
 use crate::index::vector::VectorIndexParams;
-use lance_arrow::FixedSizeListArrayExt;
-use lance_arrow::json::{JsonArray, is_arrow_json_field, json_field};
+use lance_arrow::json::{ARROW_JSON_EXT_NAME, JsonArray, is_arrow_json_field, json_field};
+use lance_arrow::{ARROW_EXT_NAME_KEY, FixedSizeListArrayExt};
 
 use crate::index::DatasetIndexExt;
 use arrow::compute::concat_batches;
 use arrow_array::UInt64Array;
-use arrow_array::{Array, FixedSizeListArray};
+use arrow_array::cast::AsArray;
+use arrow_array::{Array, FixedSizeListArray, ListArray, StructArray};
 use arrow_array::{Float32Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
-use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef};
+use arrow_buffer::{OffsetBuffer, ScalarBuffer};
+use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema, SchemaRef};
 use futures::TryStreamExt;
 use lance_arrow::SchemaExt;
 use lance_core::cache::LanceCache;
@@ -41,6 +43,82 @@ use lance_index::vector::{DEFAULT_QUERY_PARALLELISM, Query};
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
+async fn test_scan_wide_fixed_size_list_at_batch_boundary() {
+    const DIM_A: usize = 140_000;
+    const DIM_B: usize = 4_096;
+    const SHORT_ROWS: usize = 68;
+    const LONG_ROWS: usize = 128;
+
+    fn make_batch(schema: SchemaRef, rows: usize, base: usize) -> RecordBatch {
+        let values_a = Float32Array::from_iter_values(
+            (0..rows * DIM_A).map(|idx| ((idx + base) % 1009) as f32 / 1009.0),
+        );
+        let values_b = Float32Array::from_iter_values(
+            (0..rows * DIM_B).map(|idx| ((idx + base) % 251) as f32 / 251.0),
+        );
+        let arr_a = FixedSizeListArray::try_new_from_values(values_a, DIM_A as i32).unwrap();
+        let arr_b = FixedSizeListArray::try_new_from_values(values_b, DIM_B as i32).unwrap();
+        RecordBatch::try_new(schema, vec![Arc::new(arr_a), Arc::new(arr_b)]).unwrap()
+    }
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new(
+            "a",
+            DataType::FixedSizeList(
+                Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                DIM_A as i32,
+            ),
+            true,
+        ),
+        ArrowField::new(
+            "b",
+            DataType::FixedSizeList(
+                Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                DIM_B as i32,
+            ),
+            true,
+        ),
+    ]));
+
+    let batches = vec![
+        make_batch(schema.clone(), SHORT_ROWS, 0),
+        make_batch(schema.clone(), LONG_ROWS, 17),
+    ];
+    let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+    let write_params = WriteParams {
+        data_storage_version: Some(LanceFileVersion::V2_1),
+        ..WriteParams::default()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let dataset = Dataset::write(reader, dir.path().to_str().unwrap(), Some(write_params))
+        .await
+        .unwrap();
+
+    // The first column splits into 9 read chunks. The second column is a
+    // higher-priority request that can reserve the remaining buffer while the
+    // first column is still awaited.
+    let mut scanner = dataset.scan();
+    scanner.io_buffer_size(70 * 1024 * 1024);
+    scanner
+        .limit(Some(LONG_ROWS as i64), Some(SHORT_ROWS as i64))
+        .unwrap();
+    let mut stream = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        scanner.try_into_stream(),
+    )
+    .await
+    .expect("stream creation timed out")
+    .unwrap();
+    let batch = tokio::time::timeout(std::time::Duration::from_secs(20), stream.try_next())
+        .await
+        .expect("first batch timed out")
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(batch.num_rows(), LONG_ROWS);
+}
+
+#[tokio::test]
 async fn test_vector_filter_fts_search() {
     let dataset = prepare_query_filter_dataset().await;
     let schema: ArrowSchema = dataset.schema().into();
@@ -60,6 +138,7 @@ async fn test_vector_filter_fts_search() {
         use_index: true,
         query_parallelism: DEFAULT_QUERY_PARALLELISM,
         dist_q_c: 0.0,
+        approx_mode: Default::default(),
     };
 
     // Case 1: search with prefilter=true, query_filter=vector([300,300,300,300])
@@ -358,6 +437,80 @@ async fn test_scan_limit_offset_preserves_json_extension_metadata() {
         batch_with_offset.schema().field_with_name("meta").unwrap()
     ));
     assert_eq!(batch_no_offset.schema(), batch_with_offset.schema());
+}
+
+#[tokio::test]
+async fn test_scan_nested_arrow_json_extension_v2() {
+    let mut json_metadata = HashMap::new();
+    json_metadata.insert(
+        ARROW_EXT_NAME_KEY.to_string(),
+        ARROW_JSON_EXT_NAME.to_string(),
+    );
+    let item_fields = Fields::from(vec![
+        Arc::new(ArrowField::new("uri", DataType::Utf8, false)),
+        Arc::new(ArrowField::new("extra", DataType::Utf8, true).with_metadata(json_metadata)),
+    ]);
+    let item = Arc::new(ArrowField::new(
+        "item",
+        DataType::Struct(item_fields.clone()),
+        true,
+    ));
+    let media_field = ArrowField::new("media", DataType::List(item.clone()), true);
+    let schema = Arc::new(ArrowSchema::new(vec![media_field]));
+
+    for version in [
+        LanceFileVersion::V2_1,
+        LanceFileVersion::V2_2,
+        LanceFileVersion::V2_3,
+    ] {
+        let values = StructArray::new(
+            item_fields.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![Some("a.jpg"), Some("b.jpg")])) as Arc<dyn Array>,
+                Arc::new(StringArray::from(vec![
+                    Some(r#"{"codec":"h264"}"#),
+                    None::<&str>,
+                ])) as Arc<dyn Array>,
+            ],
+            None,
+        );
+        let media = ListArray::new(
+            item.clone(),
+            OffsetBuffer::new(ScalarBuffer::from(vec![0, 1, 2])),
+            Arc::new(values),
+            None,
+        );
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(media)]).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema.clone());
+        let write_params = WriteParams {
+            data_storage_version: Some(version),
+            ..WriteParams::default()
+        };
+        let uri = format!("memory://{}", Uuid::new_v4());
+        let dataset = Dataset::write(reader, &uri, Some(write_params))
+            .await
+            .unwrap();
+
+        let batch = dataset.scan().try_into_batch().await.unwrap();
+        let batch_schema = batch.schema();
+        let DataType::List(item) = batch_schema.field(0).data_type() else {
+            panic!("expected media list field");
+        };
+        let DataType::Struct(fields) = item.data_type() else {
+            panic!("expected media item struct");
+        };
+        assert!(is_arrow_json_field(&fields[1]));
+
+        let media: &ListArray = batch.column(0).as_list();
+        let items = media.values().as_struct();
+        let extra = items
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert!(extra.value(0).contains("h264"));
+        assert!(extra.is_null(1));
+    }
 }
 
 #[tokio::test]

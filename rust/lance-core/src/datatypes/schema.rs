@@ -9,9 +9,9 @@ use std::{
     sync::Arc,
 };
 
+use crate::deepsize::DeepSizeOf;
 use arrow_array::RecordBatch;
-use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
-use deepsize::DeepSizeOf;
+use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_arrow::*;
 
 use super::field::{Field, OnTypeMismatch, SchemaCompareOptions};
@@ -108,6 +108,29 @@ impl<'a> Iterator for SchemaFieldIterPreOrder<'a> {
             None
         }
     }
+}
+
+/// Reject `FixedSizeList` types whose dimension is not a positive integer.
+///
+/// The row count of a fixed-size list is derived by dividing the number of
+/// child items by the dimension, so a zero dimension panics with a
+/// divide-by-zero further down the write path (see issue #5102). A
+/// `FixedSizeList` of a `FixedSizeList` over a primitive collapses into a
+/// single leaf field, so the pre-order field walk never visits the inner list;
+/// recurse through the nested list types here to catch an inner zero dimension.
+///
+/// Shared by [`Schema::validate`] on the write path and the decoder's
+/// field-scheduler builders on the read path.
+pub fn validate_fixed_size_list_dimensions(field_name: &str, data_type: &DataType) -> Result<()> {
+    if let DataType::FixedSizeList(inner, dimension) = data_type {
+        if *dimension <= 0 {
+            return Err(Error::schema(format!(
+                "Field \"{field_name}\" contains a FixedSizeList with dimension {dimension}; dimension must be a positive integer"
+            )));
+        }
+        validate_fixed_size_list_dimensions(field_name, inner.data_type())?;
+    }
+    Ok(())
 }
 
 impl Schema {
@@ -346,6 +369,10 @@ impl Schema {
                     field.id, self
                 )));
             }
+            // The row count of a fixed-size list is derived by dividing the
+            // number of items by the dimension, so a zero dimension would
+            // panic with a divide-by-zero further down the write path.
+            validate_fixed_size_list_dimensions(&field.name, &field.data_type())?;
         }
 
         Ok(())
@@ -733,10 +760,6 @@ impl Schema {
         Ok(schema)
     }
 
-    pub fn all_fields_nullable(&self) -> bool {
-        SchemaFieldIterPreOrder::new(self).all(|f| f.nullable)
-    }
-
     /// Returns the properly formatted path from root to the field.
     /// Field names containing dots are quoted (e.g., struct.`field.with.dot`)
     pub fn field_path(&self, field_id: i32) -> Result<String> {
@@ -1048,6 +1071,17 @@ pub enum BlobHandling {
 }
 
 impl BlobHandling {
+    fn should_load_binary(&self, field: &Field) -> bool {
+        if !field.is_blob() {
+            return false;
+        }
+        match self {
+            Self::AllBinary => true,
+            Self::SomeBlobsBinary(set) | Self::SomeBinary(set) => set.contains(&(field.id as u32)),
+            Self::BlobsDescriptions | Self::AllDescriptions => false,
+        }
+    }
+
     fn should_unload(&self, field: &Field) -> bool {
         // Blob v2 columns are Structs, so we need to treat any blob-marked field as unloadable
         // even if the physical data type is not binary-like.
@@ -1063,10 +1097,34 @@ impl BlobHandling {
         }
     }
 
+    /// Whether `field` will be projected as a lightweight blob *description*
+    /// (offset + size) rather than its full binary value under this handling.
+    ///
+    /// A description is tiny and cheap to read eagerly; the full binary value is
+    /// not. Materialization heuristics use this to decide early vs late loading.
+    pub fn returns_description(&self, field: &Field) -> bool {
+        self.should_unload(field)
+    }
+
+    /// Apply this blob handling policy to a projected field tree.
+    ///
+    /// Blob descriptor modes convert blob leaves to descriptor views. Binary
+    /// modes convert selected blob leaves to `LargeBinary`. Non-blob nested
+    /// fields are preserved while their children are handled recursively.
     pub fn unload_if_needed(&self, mut field: Field) -> Field {
+        if self.should_load_binary(&field) {
+            field.binary_blob_mut();
+            return field;
+        }
         if self.should_unload(&field) {
             field.unloaded_mut();
+            return field;
         }
+        field.children = field
+            .children
+            .into_iter()
+            .map(|child| self.unload_if_needed(child))
+            .collect();
         field
     }
 }
@@ -2448,86 +2506,6 @@ mod tests {
     }
 
     #[test]
-    pub fn test_all_fields_nullable() {
-        let test_cases = vec![
-            (
-                vec![], // empty schema
-                true,
-            ),
-            (
-                vec![
-                    Field::new_arrow("a", DataType::Int32, true).unwrap(),
-                    Field::new_arrow("b", DataType::Utf8, true).unwrap(),
-                ], // basic case
-                true,
-            ),
-            (
-                vec![
-                    Field::new_arrow("a", DataType::Int32, false).unwrap(),
-                    Field::new_arrow("b", DataType::Utf8, true).unwrap(),
-                ],
-                false,
-            ),
-            (
-                // check nested schema, parent is nullable
-                vec![
-                    Field::new_arrow(
-                        "struct",
-                        DataType::Struct(ArrowFields::from(vec![ArrowField::new(
-                            "a",
-                            DataType::Int32,
-                            false,
-                        )])),
-                        true,
-                    )
-                    .unwrap(),
-                ],
-                false,
-            ),
-            (
-                // check nested schema, child is nullable
-                vec![
-                    Field::new_arrow(
-                        "struct",
-                        DataType::Struct(ArrowFields::from(vec![ArrowField::new(
-                            "a",
-                            DataType::Int32,
-                            true,
-                        )])),
-                        false,
-                    )
-                    .unwrap(),
-                ],
-                false,
-            ),
-            (
-                // check nested schema, all is nullable
-                vec![
-                    Field::new_arrow(
-                        "struct",
-                        DataType::Struct(ArrowFields::from(vec![ArrowField::new(
-                            "a",
-                            DataType::Int32,
-                            true,
-                        )])),
-                        true,
-                    )
-                    .unwrap(),
-                ],
-                true,
-            ),
-        ];
-
-        for (fields, expected) in test_cases {
-            let schema = Schema {
-                fields,
-                metadata: Default::default(),
-            };
-            assert_eq!(schema.all_fields_nullable(), expected);
-        }
-    }
-
-    #[test]
     fn test_schema_unenforced_primary_key() {
         let cases = vec![
             ArrowSchema::new(vec![ArrowField::new("a", DataType::Int32, false)]),
@@ -2823,6 +2801,67 @@ mod tests {
         assert!(paths.contains(&"id".to_string()));
         assert!(paths.contains(&"vector".to_string()));
         assert!(paths.contains(&"name".to_string()));
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_dimension_fixed_size_list() {
+        // A zero dimension divides-by-zero further down the write path (#5102)
+        let fsl = |dimension: i32| {
+            ArrowDataType::FixedSizeList(
+                Arc::new(ArrowField::new("item", ArrowDataType::Float32, true)),
+                dimension,
+            )
+        };
+
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("vec", fsl(0), true)]);
+        let err = Schema::try_from(&arrow_schema).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("dimension must be a positive integer"),
+            "unexpected error: {}",
+            err
+        );
+
+        // Nested inside a struct is rejected too
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+            "outer",
+            ArrowDataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                "vec",
+                fsl(0),
+                true,
+            )])),
+            true,
+        )]);
+        let err = Schema::try_from(&arrow_schema).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("dimension must be a positive integer"),
+            "unexpected error: {}",
+            err
+        );
+
+        // A zero-dimension FixedSizeList nested inside a positive-dimension
+        // FixedSizeList collapses into a single leaf field, so the inner
+        // dimension is not visited by the pre-order field walk and must still
+        // be rejected: FixedSizeList(FixedSizeList(Float32, 0), 4).
+        let nested =
+            ArrowDataType::FixedSizeList(Arc::new(ArrowField::new("inner", fsl(0), true)), 4);
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("vec", nested, true)]);
+        let err = Schema::try_from(&arrow_schema).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("dimension must be a positive integer"),
+            "unexpected error: {}",
+            err
+        );
+
+        // A positive dimension still validates, including nested lists
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("vec", fsl(2), true)]);
+        assert!(Schema::try_from(&arrow_schema).is_ok());
+        let nested_ok =
+            ArrowDataType::FixedSizeList(Arc::new(ArrowField::new("inner", fsl(2), true)), 4);
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("vec", nested_ok, true)]);
+        assert!(Schema::try_from(&arrow_schema).is_ok());
     }
 
     #[test]

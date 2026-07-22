@@ -45,7 +45,7 @@ use {
 };
 
 use crate::vector::utils::SimpleIndex;
-use crate::{Error, Result};
+use lance_core::{Error, Result};
 
 /// KMean initialization method.
 #[derive(Debug, PartialEq)]
@@ -561,6 +561,24 @@ impl KMeansAlgo<u8> for KModeAlgo {
     }
 }
 
+/// Cluster id assignment for each vector in a batch.
+pub type KMeansMembership = Vec<Option<u32>>;
+
+/// Distance from each vector to its assigned centroid.
+pub type KMeansDistances = Vec<Option<f32>>;
+
+/// Maximum assignment distance per centroid.
+pub type KMeansClusterRadii = Vec<f32>;
+
+/// Sum of assignment distances per centroid.
+pub type KMeansClusterLosses = Vec<f64>;
+
+/// Batch assignment results with per-centroid radii and losses.
+pub type KMeansMembershipAndLoss = (KMeansMembership, KMeansClusterRadii, KMeansClusterLosses);
+
+/// Batch assignment results with per-vector distances.
+pub type KMeansMembershipAndDistances = (KMeansMembership, KMeansDistances);
+
 /// KMeans implementation for Apache Arrow Arrays.
 #[derive(Debug, Clone)]
 pub struct KMeans {
@@ -636,6 +654,116 @@ impl KMeans {
         Self::new_with_params(data, k, &params)
     }
 
+    /// Assign a batch of vectors to these centroids and return membership, radius, and loss.
+    pub fn compute_membership_and_loss(
+        &self,
+        data: &FixedSizeListArray,
+    ) -> arrow::error::Result<KMeansMembershipAndLoss> {
+        let (membership, distances) = self.compute_membership_and_distances(data)?;
+        let k = self.centroids.len() / self.dimension;
+        let mut cluster_radius: Vec<f32> = vec![0.0_f32; k];
+        let mut losses = vec![0.0; k];
+        for (cluster_id, dist) in membership.iter().zip(distances.iter()) {
+            if let (Some(cluster_id), Some(dist)) = (cluster_id, dist) {
+                let cluster_id = *cluster_id as usize;
+                cluster_radius[cluster_id] = cluster_radius[cluster_id].max(*dist);
+                losses[cluster_id] += *dist as f64;
+            }
+        }
+        Ok((membership, cluster_radius, losses))
+    }
+
+    /// Assign a batch of vectors to these centroids and return per-vector distances.
+    pub fn compute_membership_and_distances(
+        &self,
+        data: &FixedSizeListArray,
+    ) -> arrow::error::Result<KMeansMembershipAndDistances> {
+        if data.value_length() as usize != self.dimension {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "KMeans: data dimension {} does not match centroid dimension {}",
+                data.value_length(),
+                self.dimension
+            )));
+        }
+
+        let index = SimpleIndex::may_train_index(
+            self.centroids.clone(),
+            self.dimension,
+            self.distance_type,
+        )
+        .map_err(|e| ArrowError::ExternalError(Box::new(e)))?;
+        match (
+            data.value_type(),
+            self.centroids.data_type(),
+            self.distance_type,
+        ) {
+            (DataType::Float16, DataType::Float16, _) => {
+                let data_values = data.values().as_primitive::<Float16Type>().values();
+                let centroids = self.centroids.as_primitive::<Float16Type>().values();
+                Ok(KMeansAlgoFloat::<Float16Type>::compute_membership_and_dist(
+                    centroids,
+                    data_values,
+                    self.dimension,
+                    self.distance_type,
+                    0.0,
+                    None,
+                    index.as_ref(),
+                ))
+            }
+            (DataType::Float32, DataType::Float32, _) => {
+                let data_values = data.values().as_primitive::<Float32Type>().values();
+                let centroids = self.centroids.as_primitive::<Float32Type>().values();
+                Ok(KMeansAlgoFloat::<Float32Type>::compute_membership_and_dist(
+                    centroids,
+                    data_values,
+                    self.dimension,
+                    self.distance_type,
+                    0.0,
+                    None,
+                    index.as_ref(),
+                ))
+            }
+            (DataType::Float64, DataType::Float64, _) => {
+                let data_values = data.values().as_primitive::<Float64Type>().values();
+                let centroids = self.centroids.as_primitive::<Float64Type>().values();
+                Ok(KMeansAlgoFloat::<Float64Type>::compute_membership_and_dist(
+                    centroids,
+                    data_values,
+                    self.dimension,
+                    self.distance_type,
+                    0.0,
+                    None,
+                    index.as_ref(),
+                ))
+            }
+            (DataType::UInt8, DataType::UInt8, DistanceType::Hamming) => {
+                let data_values = data.values().as_primitive::<UInt8Type>().values();
+                let centroids = self.centroids.as_primitive::<UInt8Type>().values();
+                Ok(KModeAlgo::compute_membership_and_dist(
+                    centroids,
+                    data_values,
+                    self.dimension,
+                    self.distance_type,
+                    0.0,
+                    None,
+                    index.as_ref(),
+                ))
+            }
+            _ => Err(ArrowError::InvalidArgumentError(format!(
+                "KMeans: can not compute membership for data type {} with centroid type {} and distance type {}",
+                data.value_type(),
+                self.centroids.data_type(),
+                self.distance_type
+            ))),
+        }
+    }
+
+    /// Compute the kmeans loss for a batch of vectors against these centroids.
+    pub fn compute_loss(&self, data: &FixedSizeListArray) -> arrow::error::Result<f64> {
+        let (_, _, losses) = self.compute_membership_and_loss(data)?;
+        Ok(losses.iter().sum())
+    }
+
     fn train_kmeans<T: ArrowNumericType, Algo: KMeansAlgo<T::Native>>(
         data: &FixedSizeListArray,
         k: usize,
@@ -672,14 +800,14 @@ impl KMeans {
         let mut adjusted_balance_factor = f32::MAX;
 
         // TODO: use seed for Rng.
-        let rng = SmallRng::from_os_rng();
+        let mut rng = SmallRng::from_os_rng();
         for redo in 1..=params.redos {
             let mut kmeans: Self = match &params.init {
                 KMeanInit::Random => Self::init_random::<T>(
                     data.values(),
                     dimension,
                     k,
-                    rng.clone(),
+                    &mut rng,
                     params.distance_type,
                 ),
                 KMeanInit::Incremental(centroids) => Self::with_centroids(
@@ -1028,7 +1156,16 @@ impl KMeans {
                 target_k
             );
         }
-        debug_assert_eq!(heap.len(), target_k);
+        if heap.len() < target_k {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "Cannot create {target_k} IVF partitions: k-means could only form {} non-empty \
+                 clusters from {n} training vectors. The dataset is likely too small or has too \
+                 many (near-)duplicate vectors for this many partitions. Reduce num_partitions to \
+                 <= {} or provide more diverse data.",
+                heap.len(),
+                heap.len()
+            )));
+        }
 
         // Construct final KMeans model with all centroids
         let mut all_clusters: Vec<Cluster<T::Native>> = heap.into_vec();
@@ -1464,6 +1601,21 @@ mod tests {
         assert_eq!(expected, actual);
     }
 
+    #[test]
+    fn test_random_init_advances_rng() {
+        let values = Float32Array::from_iter_values((0..64).map(|value| value as f32));
+        let mut rng = SmallRng::seed_from_u64(42);
+        let first =
+            KMeans::init_random::<Float32Type>(values.values(), 1, 8, &mut rng, DistanceType::L2);
+        let second =
+            KMeans::init_random::<Float32Type>(values.values(), 1, 8, &mut rng, DistanceType::L2);
+
+        assert_ne!(
+            first.centroids.as_primitive::<Float32Type>().values(),
+            second.centroids.as_primitive::<Float32Type>().values(),
+        );
+    }
+
     #[tokio::test]
     async fn test_compute_membership_and_loss() {
         const DIM: usize = 256;
@@ -1577,6 +1729,47 @@ mod tests {
         for val in centroids {
             assert!(!val.is_nan(), "Centroid should not contain NaN values");
         }
+    }
+
+    #[tokio::test]
+    async fn test_hierarchical_kmeans_too_few_distinct_vectors_errors() {
+        // Regression test for https://github.com/lance-format/lance/issues/7867
+        //
+        // With a small number of distinct vectors repeated many times (heavy
+        // near-duplication) and dot distance, hierarchical k-means cannot form
+        // `target_k` non-empty clusters no matter how it splits: every split of a
+        // cluster of identical vectors is either ineffective (`all_same`) or
+        // immediately hits the "<= 1 point" floor. This used to trip
+        // `debug_assert_eq!(heap.len(), target_k)` (panic in debug builds) or
+        // silently return a half-empty centroid set (release builds). It should
+        // now return a clear error instead.
+        const DIM: usize = 8;
+        const NUM_DISTINCT: usize = 5;
+        const REPEATS: usize = 200;
+        const TARGET_K: usize = 300; // > 256 to trigger hierarchical clustering
+
+        let base_vectors = generate_random_array(NUM_DISTINCT * DIM);
+        let mut values = Vec::with_capacity(NUM_DISTINCT * REPEATS * DIM);
+        for _ in 0..REPEATS {
+            values.extend_from_slice(base_vectors.values());
+        }
+        let values = Float32Array::from(values);
+        let fsl = FixedSizeListArray::try_new_from_values(values, DIM as i32).unwrap();
+
+        let params = KMeansParams {
+            max_iters: 10,
+            hierarchical_k: 16,
+            distance_type: DistanceType::Dot,
+            ..Default::default()
+        };
+
+        let err = KMeans::new_with_params(&fsl, TARGET_K, &params)
+            .expect_err("training should fail rather than panic or silently under-produce");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Cannot create") && msg.contains(&TARGET_K.to_string()),
+            "unexpected error message: {msg}"
+        );
     }
 
     #[tokio::test]

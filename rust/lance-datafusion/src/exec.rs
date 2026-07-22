@@ -4,9 +4,9 @@
 //! Utilities for working with datafusion execution plans
 
 use std::{
-    any::Any,
     collections::HashMap,
     fmt::{self, Formatter},
+    num::NonZero,
     sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
@@ -15,9 +15,8 @@ use chrono::{DateTime, Utc};
 
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
-use datafusion::physical_plan::metrics::MetricType;
 use datafusion::{
-    catalog::streaming::StreamingTable,
+    catalog::{TableProvider, streaming::StreamingTable},
     dataframe::DataFrame,
     execution::{
         TaskContext,
@@ -27,20 +26,23 @@ use datafusion::{
         runtime_env::RuntimeEnvBuilder,
     },
     physical_plan::{
-        DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
+        DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
+        SendableRecordBatchStream,
         analyze::AnalyzeExec,
+        coalesce_partitions::CoalescePartitionsExec,
         display::DisplayableExecutionPlan,
         execution_plan::{Boundedness, CardinalityEffect, EmissionType},
         metrics::MetricValue,
+        sorts::sort_preserving_merge::SortPreservingMergeExec,
         stream::RecordBatchStreamAdapter,
         streaming::PartitionStream,
     },
 };
+use datafusion::{execution::memory_pool::TrackConsumersPool, physical_plan::metrics::MetricType};
 use datafusion_common::{DataFusionError, Statistics};
-use datafusion_common_runtime::{JoinSetTracer, set_join_set_tracer};
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 
-use futures::{FutureExt, StreamExt, future::BoxFuture, stream};
+use futures::{StreamExt, stream};
 use lance_arrow::SchemaExt;
 use lance_core::{
     Error, Result,
@@ -50,7 +52,7 @@ use lance_core::{
     },
 };
 use log::{debug, info, warn};
-use tracing::{Instrument, Span};
+use tracing::Span;
 
 use crate::udf::register_functions;
 use crate::{
@@ -60,37 +62,6 @@ use crate::{
         MetricsExt, PARTS_LOADED_METRIC, REQUESTS_METRIC,
     },
 };
-
-static DATAFUSION_JOIN_SET_TRACER: LanceJoinSetTracer = LanceJoinSetTracer;
-static DATAFUSION_JOIN_SET_TRACER_INIT: OnceLock<()> = OnceLock::new();
-
-struct LanceJoinSetTracer;
-
-impl JoinSetTracer for LanceJoinSetTracer {
-    fn trace_future(
-        &self,
-        fut: BoxFuture<'static, Box<dyn Any + Send>>,
-    ) -> BoxFuture<'static, Box<dyn Any + Send>> {
-        fut.instrument(Span::current()).boxed()
-    }
-
-    fn trace_block(
-        &self,
-        f: Box<dyn FnOnce() -> Box<dyn Any + Send> + Send>,
-    ) -> Box<dyn FnOnce() -> Box<dyn Any + Send> + Send> {
-        let span = Span::current();
-        Box::new(move || {
-            let _guard = span.enter();
-            f()
-        })
-    }
-}
-
-fn ensure_datafusion_task_tracing() {
-    DATAFUSION_JOIN_SET_TRACER_INIT.get_or_init(|| {
-        let _ = set_join_set_tracer(&DATAFUSION_JOIN_SET_TRACER);
-    });
-}
 
 /// An source execution node created from an existing stream
 ///
@@ -184,10 +155,6 @@ impl ExecutionPlan for OneShotExec {
         "OneShotExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn schema(&self) -> arrow_schema::SchemaRef {
         self.schema.clone()
     }
@@ -275,10 +242,6 @@ impl ExecutionPlan for TracedExec {
         "TracedExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
@@ -342,7 +305,7 @@ impl std::fmt::Debug for LanceExecutionOptions {
     }
 }
 
-const DEFAULT_LANCE_MEM_POOL_SIZE_PER_PARTITION: u64 = 100 * 1024 * 1024;
+const DEFAULT_LANCE_MEM_POOL_SIZE_PER_PARTITION: u64 = 150 * 1024 * 1024;
 const DEFAULT_LANCE_MAX_TEMP_DIRECTORY_SIZE: u64 = 100 * 1024 * 1024 * 1024; // 100GB
 
 impl LanceExecutionOptions {
@@ -398,12 +361,21 @@ pub fn new_session_context(options: &LanceExecutionOptions) -> SessionContext {
         session_config = session_config.with_target_partitions(target_partition);
     }
     if options.use_spilling() {
+        // The default 10MB sort spill reservation seems to be too small for many common cases.
+        //
+        // There currently is no reasonable guidance provided by DataFusion for setting this value.
+        // We bump this to 40MB but try a smaller value if the mem pool is small.
+        let sort_spill_reservation_bytes =
+            (options.mem_pool_size() / 3).min(40 * 1024 * 1024) as usize;
+        session_config =
+            session_config.with_sort_spill_reservation_bytes(sort_spill_reservation_bytes);
         let disk_manager_builder = DiskManagerBuilder::default()
             .with_max_temp_directory_size(options.max_temp_directory_size());
         runtime_env_builder = runtime_env_builder
             .with_disk_manager_builder(disk_manager_builder)
-            .with_memory_pool(Arc::new(FairSpillPool::new(
-                options.mem_pool_size() as usize
+            .with_memory_pool(Arc::new(TrackConsumersPool::new(
+                FairSpillPool::new(options.mem_pool_size() as usize),
+                NonZero::try_from(16).unwrap(),
             )));
     }
     let runtime_env = runtime_env_builder.build_arc().unwrap();
@@ -630,8 +602,6 @@ pub fn execute_plan(
     plan: Arc<dyn ExecutionPlan>,
     options: LanceExecutionOptions,
 ) -> Result<SendableRecordBatchStream> {
-    ensure_datafusion_task_tracing();
-
     if !options.skip_logging {
         debug!(
             "Executing plan:\n{}",
@@ -639,19 +609,27 @@ pub fn execute_plan(
         );
     }
 
-    // Keep the entire execution plan stream under the caller's current span.
-    // Without this wrapper, lazy plan nodes like FilteredReadExec only build
-    // their inner streams on first poll, after execute_with_options() has
-    // already returned to the caller. In multi-threaded runtimes that means
-    // downstream spawn_in_current_span()/boxed_in_current_span() sites can
-    // observe <none> and emit detached spans.
-    let traced_plan = Arc::new(TracedExec::new(plan.clone(), Span::current()));
     let session_ctx = get_session_context(&options);
 
-    // NOTE: we are only executing the first partition here. Therefore, if
-    // the plan has more than one partition, we will be missing data.
-    assert_eq!(traced_plan.properties().partitioning.partition_count(), 1);
-    let stream = traced_plan.execute(0, get_task_context(&session_ctx, &options))?;
+    // Coalesce to a single partition if the optimizer left more than one.
+    // EnforceDistribution may remove RepartitionExec(1) nodes when the parent
+    // declares UnspecifiedDistribution, leaving multi-partition plans here.
+    //
+    // If the plan carries an output ordering (e.g. a top-k `SortExec` whose
+    // result was later repartitioned to parallelize downstream operators),
+    // a plain `CoalescePartitionsExec` would scramble that order because it
+    // merges partitions in scheduling-dependent order. Use an order-preserving
+    // merge in that case instead, mirroring what `EnforceDistribution` itself
+    // does when it needs to merge an ordered, multi-partition plan.
+    let plan: Arc<dyn ExecutionPlan> = if plan.properties().partitioning.partition_count() == 1 {
+        plan
+    } else if let Some(ordering) = plan.output_ordering() {
+        Arc::new(SortPreservingMergeExec::new(ordering.clone(), plan))
+    } else {
+        Arc::new(CoalescePartitionsExec::new(plan))
+    };
+
+    let stream = plan.execute(0, get_task_context(&session_ctx, &options))?;
 
     let schema = stream.schema();
     let stream = stream.finally(move || {
@@ -666,8 +644,6 @@ pub async fn analyze_plan(
     plan: Arc<dyn ExecutionPlan>,
     options: LanceExecutionOptions,
 ) -> Result<String> {
-    ensure_datafusion_task_tracing();
-
     // This is needed as AnalyzeExec launches a thread task per
     // partition, and we want these to be connected to the parent span
     let plan = Arc::new(TracedExec::new(plan, Span::current()));
@@ -677,7 +653,8 @@ pub async fn analyze_plan(
     let analyze = Arc::new(AnalyzeExec::new(
         true,
         true,
-        vec![MetricType::SUMMARY],
+        vec![MetricType::Summary],
+        None,
         plan,
         schema,
     ));
@@ -904,6 +881,49 @@ impl SessionContextExt for SessionContext {
     }
 }
 
+/// Scan a [`TableProvider`] into a single-partition [`SendableRecordBatchStream`].
+///
+/// Multi-partition providers are coalesced into a single partition. This adapts a
+/// re-scannable provider back into the one stream the writer pipeline consumes;
+/// re-scanning the same provider (e.g. on a write retry) yields a fresh stream.
+///
+/// # Examples
+///
+/// ```
+/// # use std::sync::Arc;
+/// # use arrow_array::{Int32Array, RecordBatch};
+/// # use arrow_schema::{DataType, Field, Schema};
+/// # use datafusion::catalog::TableProvider;
+/// # use datafusion::datasource::MemTable;
+/// # use futures::TryStreamExt;
+/// # use lance_datafusion::exec::provider_to_stream;
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+/// let batch =
+///     RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 2, 3]))])?;
+/// let provider: Arc<dyn TableProvider> = Arc::new(MemTable::try_new(schema, vec![vec![batch]])?);
+///
+/// // A re-scannable provider yields a fresh stream on each call.
+/// let batches: Vec<RecordBatch> = provider_to_stream(provider).await?.try_collect().await?;
+/// assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+/// # Ok(())
+/// # }
+/// ```
+pub async fn provider_to_stream(
+    provider: Arc<dyn TableProvider>,
+) -> Result<SendableRecordBatchStream> {
+    let ctx = SessionContext::new();
+    let plan = provider.scan(&ctx.state(), None, &[], None).await?;
+    let plan: Arc<dyn ExecutionPlan> =
+        if plan.properties().output_partitioning().partition_count() > 1 {
+            Arc::new(CoalescePartitionsExec::new(plan))
+        } else {
+            plan
+        };
+    Ok(plan.execute(0, ctx.task_ctx())?)
+}
+
 #[derive(Clone, Debug)]
 pub struct StrictBatchSizeExec {
     input: Arc<dyn ExecutionPlan>,
@@ -929,10 +949,6 @@ impl DisplayAs for StrictBatchSizeExec {
 impl ExecutionPlan for StrictBatchSizeExec {
     fn name(&self) -> &str {
         "StrictBatchSizeExec"
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -975,7 +991,7 @@ impl ExecutionPlan for StrictBatchSizeExec {
     fn partition_statistics(
         &self,
         partition: Option<usize>,
-    ) -> datafusion_common::Result<Statistics> {
+    ) -> datafusion_common::Result<std::sync::Arc<Statistics>> {
         self.input.partition_statistics(partition)
     }
 
@@ -1035,10 +1051,6 @@ impl DisplayAs for HardCapBatchSizeExec {
 impl ExecutionPlan for HardCapBatchSizeExec {
     fn name(&self) -> &str {
         "HardCapBatchSizeExec"
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -1102,7 +1114,7 @@ impl ExecutionPlan for HardCapBatchSizeExec {
     fn partition_statistics(
         &self,
         partition: Option<usize>,
-    ) -> datafusion_common::Result<Statistics> {
+    ) -> datafusion_common::Result<std::sync::Arc<Statistics>> {
         self.input.partition_statistics(partition)
     }
 
@@ -1251,68 +1263,5 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(opts.mem_pool_size(), 50 * 1024 * 1024);
-    }
-
-    #[tokio::test]
-    async fn test_join_set_tracer_trace_future() {
-        let tracer = LanceJoinSetTracer;
-        let fut: BoxFuture<'static, Box<dyn Any + Send>> =
-            (async { Box::new(42i32) as Box<dyn Any + Send> }).boxed();
-        let traced_fut = tracer.trace_future(fut);
-        let result = traced_fut.await;
-        assert_eq!(*result.downcast::<i32>().unwrap(), 42);
-    }
-
-    #[test]
-    fn test_join_set_tracer_trace_block() {
-        let tracer = LanceJoinSetTracer;
-        let f: Box<dyn FnOnce() -> Box<dyn Any + Send> + Send> =
-            Box::new(|| Box::new(42i32) as Box<dyn Any + Send>);
-        let traced_f = tracer.trace_block(f);
-        let result = traced_f();
-        assert_eq!(*result.downcast::<i32>().unwrap(), 42);
-    }
-
-    #[test]
-    fn test_traced_exec_display_and_debug() {
-        let schema = Arc::new(ArrowSchema::empty());
-        let input: Arc<dyn ExecutionPlan> =
-            Arc::new(OneShotExec::from_batch(RecordBatch::new_empty(schema)));
-        let traced = TracedExec::new(input, Span::current());
-
-        // Debug
-        assert_eq!(format!("{:?}", traced), "TracedExec");
-
-        // DisplayAs (all variants should produce "TracedExec")
-        struct Wrapper<'a>(&'a TracedExec, DisplayFormatType);
-        impl<'a> std::fmt::Display for Wrapper<'a> {
-            fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                self.0.fmt_as(self.1, f)
-            }
-        }
-        assert_eq!(
-            format!("{}", Wrapper(&traced, DisplayFormatType::Default)),
-            "TracedExec"
-        );
-        assert_eq!(
-            format!("{}", Wrapper(&traced, DisplayFormatType::Verbose)),
-            "TracedExec"
-        );
-    }
-
-    #[test]
-    fn test_traced_exec_with_new_children() {
-        let schema = Arc::new(ArrowSchema::empty());
-        let input1: Arc<dyn ExecutionPlan> = Arc::new(OneShotExec::from_batch(
-            RecordBatch::new_empty(schema.clone()),
-        ));
-        let input2: Arc<dyn ExecutionPlan> =
-            Arc::new(OneShotExec::from_batch(RecordBatch::new_empty(schema)));
-
-        let traced = Arc::new(TracedExec::new(input1, Span::current()));
-        let new_traced = traced.with_new_children(vec![input2]).unwrap();
-
-        assert_eq!(new_traced.name(), "TracedExec");
-        assert_eq!(new_traced.children().len(), 1);
     }
 }

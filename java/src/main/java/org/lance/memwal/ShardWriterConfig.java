@@ -15,6 +15,8 @@ package org.lance.memwal;
 
 import com.google.common.base.Preconditions;
 
+import java.util.Collections;
+import java.util.List;
 import java.util.Optional;
 
 /**
@@ -26,7 +28,6 @@ import java.util.Optional;
  */
 public class ShardWriterConfig {
   private Optional<Boolean> durableWrite = Optional.empty();
-  private Optional<Boolean> syncIndexedWrite = Optional.empty();
   private Optional<Long> maxWalBufferSize = Optional.empty();
   private Optional<Long> maxWalFlushIntervalMs = Optional.empty();
   private Optional<Long> maxMemtableSize = Optional.empty();
@@ -34,20 +35,13 @@ public class ShardWriterConfig {
   private Optional<Long> maxMemtableBatches = Optional.empty();
   private Optional<Long> maxUnflushedMemtableBytes = Optional.empty();
   private Optional<Long> manifestScanBatchSize = Optional.empty();
-  private Optional<Long> asyncIndexBufferRows = Optional.empty();
-  private Optional<Long> asyncIndexIntervalMs = Optional.empty();
   private Optional<Long> backpressureLogIntervalMs = Optional.empty();
   private Optional<Long> statsLogIntervalMs = Optional.empty();
+  private List<MemWalHnswParams> hnswParams = Collections.emptyList();
 
   /** Whether each {@code put} is durably persisted to the WAL before returning. */
   public ShardWriterConfig withDurableWrite(boolean durableWrite) {
     this.durableWrite = Optional.of(durableWrite);
-    return this;
-  }
-
-  /** Whether indexed writes are applied synchronously. */
-  public ShardWriterConfig withSyncIndexedWrite(boolean syncIndexedWrite) {
-    this.syncIndexedWrite = Optional.of(syncIndexedWrite);
     return this;
   }
 
@@ -115,26 +109,6 @@ public class ShardWriterConfig {
     return this;
   }
 
-  /** Number of rows buffered before an asynchronous index update is triggered. */
-  public ShardWriterConfig withAsyncIndexBufferRows(long asyncIndexBufferRows) {
-    Preconditions.checkArgument(
-        asyncIndexBufferRows >= 0,
-        "asyncIndexBufferRows must not be negative, got %s",
-        asyncIndexBufferRows);
-    this.asyncIndexBufferRows = Optional.of(asyncIndexBufferRows);
-    return this;
-  }
-
-  /** Interval between asynchronous index updates, in milliseconds. */
-  public ShardWriterConfig withAsyncIndexIntervalMs(long asyncIndexIntervalMs) {
-    Preconditions.checkArgument(
-        asyncIndexIntervalMs >= 0,
-        "asyncIndexIntervalMs must not be negative, got %s",
-        asyncIndexIntervalMs);
-    this.asyncIndexIntervalMs = Optional.of(asyncIndexIntervalMs);
-    return this;
-  }
-
   /** Interval between backpressure log messages, in milliseconds. */
   public ShardWriterConfig withBackpressureLogIntervalMs(long backpressureLogIntervalMs) {
     Preconditions.checkArgument(
@@ -155,12 +129,18 @@ public class ShardWriterConfig {
     return this;
   }
 
-  public Optional<Boolean> durableWrite() {
-    return durableWrite;
+  /**
+   * Per-index HNSW build-parameter overrides for the MemTable this writer builds. Each {@link
+   * MemWalHnswParams#indexName} should reference a maintained vector index.
+   */
+  public ShardWriterConfig withHnswParams(List<MemWalHnswParams> hnswParams) {
+    Preconditions.checkNotNull(hnswParams, "hnswParams must not be null");
+    this.hnswParams = hnswParams;
+    return this;
   }
 
-  public Optional<Boolean> syncIndexedWrite() {
-    return syncIndexedWrite;
+  public Optional<Boolean> durableWrite() {
+    return durableWrite;
   }
 
   public Optional<Long> maxWalBufferSize() {
@@ -191,19 +171,15 @@ public class ShardWriterConfig {
     return manifestScanBatchSize;
   }
 
-  public Optional<Long> asyncIndexBufferRows() {
-    return asyncIndexBufferRows;
-  }
-
-  public Optional<Long> asyncIndexIntervalMs() {
-    return asyncIndexIntervalMs;
-  }
-
   public Optional<Long> backpressureLogIntervalMs() {
     return backpressureLogIntervalMs;
   }
 
   public Optional<Long> statsLogIntervalMs() {
     return statsLogIntervalMs;
+  }
+
+  public List<MemWalHnswParams> hnswParams() {
+    return hnswParams;
   }
 }

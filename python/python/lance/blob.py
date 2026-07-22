@@ -1,13 +1,37 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import ctypes
 import io
 from dataclasses import dataclass
 from typing import IO, Any, Iterator, Optional, Union
 
 import pyarrow as pa
 
-from .lance import LanceBlobFile
+from .lance import (
+    BlobDescriptor as BlobDescriptor,
+)
+from .lance import (
+    BlobDescriptorArrayBuilder as BlobDescriptorArrayBuilder,
+)
+from .lance import (
+    DedicatedBlobWriter as DedicatedBlobWriter,
+)
+from .lance import (
+    LanceBlobFile,
+)
+from .lance import (
+    PackedBlobWriter as PackedBlobWriter,
+)
+
+_BLOB_INLINE_SIZE_THRESHOLD_META_KEY = b"lance-encoding:blob-inline-size-threshold"
+_BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY = (
+    b"lance-encoding:blob-dedicated-size-threshold"
+)
+_BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY = (
+    b"lance-encoding:blob-pack-file-size-threshold"
+)
+_MAX_RUST_USIZE = ctypes.c_size_t(-1).value
 
 
 @dataclass(frozen=True)
@@ -190,9 +214,78 @@ def blob_array(values: list[Any]) -> BlobArray:
     return BlobArray.from_pylist(values)
 
 
-def blob_field(name: str, *, nullable: bool = True) -> pa.Field:
-    """Construct an Arrow field for a Lance blob column."""
-    return pa.field(name, BlobType(), nullable=nullable)
+def _validate_threshold(name: str, value: Optional[int], *, allow_zero: bool) -> None:
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an int, got {type(value).__name__}")
+    if allow_zero:
+        if value < 0:
+            raise ValueError(f"{name} must be non-negative")
+    elif value <= 0:
+        raise ValueError(f"{name} must be positive")
+    if value > _MAX_RUST_USIZE:
+        raise OverflowError(f"{name} must fit in a Rust usize")
+
+
+def blob_field(
+    name: str,
+    *,
+    nullable: bool = True,
+    inline_size_threshold: Optional[int] = None,
+    dedicated_size_threshold: Optional[int] = None,
+    pack_file_size_threshold: Optional[int] = None,
+) -> pa.Field:
+    """
+    Construct an Arrow field for a Lance blob column.
+
+    Parameters
+    ----------
+    name : str
+        Field name.
+    nullable : bool, default True
+        Whether the blob column accepts null values.
+    inline_size_threshold : optional, int
+        Maximum payload size in bytes to keep inline in the data file before
+        using packed blob storage.
+    dedicated_size_threshold : optional, int
+        Maximum payload size in bytes to store in packed blob storage before
+        using dedicated blob storage. This threshold is checked before
+        ``inline_size_threshold``.
+    pack_file_size_threshold : optional, int
+        Maximum size in bytes of a single packed blob sidecar (``.pack``) file.
+        Once a sidecar reaches this size a new one is started.
+    """
+    _validate_threshold("inline_size_threshold", inline_size_threshold, allow_zero=True)
+    _validate_threshold(
+        "dedicated_size_threshold", dedicated_size_threshold, allow_zero=False
+    )
+    _validate_threshold(
+        "pack_file_size_threshold", pack_file_size_threshold, allow_zero=False
+    )
+
+    field = pa.field(name, BlobType(), nullable=nullable)
+    if (
+        inline_size_threshold is None
+        and dedicated_size_threshold is None
+        and pack_file_size_threshold is None
+    ):
+        return field
+
+    metadata = dict(field.metadata or {})
+    if inline_size_threshold is not None:
+        metadata[_BLOB_INLINE_SIZE_THRESHOLD_META_KEY] = str(
+            inline_size_threshold
+        ).encode()
+    if dedicated_size_threshold is not None:
+        metadata[_BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY] = str(
+            dedicated_size_threshold
+        ).encode()
+    if pack_file_size_threshold is not None:
+        metadata[_BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY] = str(
+            pack_file_size_threshold
+        ).encode()
+    return field.with_metadata(metadata)
 
 
 class BlobIterator:
@@ -212,9 +305,11 @@ class BlobColumn:
     file-like objects.
 
     This can be useful for working with medium-to-small binary objects that need
-    to interface with APIs that expect file-like objects.  For very large binary
-    objects (4-8MB or more per value) you might be better off creating a blob column
-    and using :py:meth:`lance.Dataset.take_blobs` to access the blob data.
+    to interface with APIs that expect file-like objects. For very large binary
+    objects (4-8MB or more per value) you might be better off creating a blob
+    column. Use :py:meth:`lance.Dataset.read_blobs` when you need complete blob
+    bytes, or :py:meth:`lance.Dataset.take_blobs` when you need lazy file-like
+    access.
     """
 
     def __init__(self, blob_column: Union[pa.Array, pa.ChunkedArray]):

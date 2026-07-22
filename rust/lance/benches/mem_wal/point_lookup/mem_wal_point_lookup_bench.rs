@@ -247,7 +247,15 @@ async fn run_prepare(args: &Args) -> Result<()> {
     }
     let reader = RecordBatchIterator::new(batches.into_iter(), schema.clone());
     let start = Instant::now();
-    let mut dataset = Dataset::write(reader, &args.uri, Some(WriteParams::default())).await?;
+    let mut dataset = Dataset::write(
+        reader,
+        &args.uri,
+        Some(WriteParams {
+            data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await?;
     let write_s = start.elapsed().as_secs_f64();
     println!("wrote {} base rows in {write_s:.1}s", args.base_rows);
 
@@ -326,9 +334,10 @@ async fn run_lookup(args: &Args) -> Result<serde_json::Value> {
     let max_memtable_rows = args.max_memtable_rows;
     let config = ShardWriterConfig {
         shard_id,
+        max_wal_persist_retries: 3,
+        wal_persist_retry_base_delay: std::time::Duration::from_millis(50),
         shard_spec_id: 0,
         durable_write: false,
-        sync_indexed_write: false,
         max_memtable_size: max_memtable_rows * 200,
         max_memtable_rows,
         max_wal_flush_interval: Some(Duration::from_secs(60)),

@@ -13,7 +13,7 @@ use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
+use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, Gauge, MetricsSet};
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::union::UnionExec;
@@ -24,7 +24,7 @@ use datafusion_physical_plan::joins::{HashJoinExec, PartitionMode};
 use datafusion_physical_plan::metrics::{BaselineMetrics, Count};
 use futures::future::try_join_all;
 use futures::stream::{self};
-use futures::{StreamExt, TryStreamExt};
+use futures::{FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_core::{
     Error, ROW_ID, Result,
@@ -34,10 +34,13 @@ use lance_datafusion::utils::{ExecutionPlanMetricsSetExt, MetricsExt, PARTITIONS
 use lance_table::format::IndexMetadata;
 
 use super::PreFilterSource;
-use super::utils::{IndexMetrics, InstrumentedChildInputStream, build_prefilter};
+use super::utils::{IndexMetrics, build_prefilter};
 use crate::index::scalar::inverted::{load_segment_details, load_segments};
 use crate::{Dataset, index::DatasetIndexInternalExt};
-use lance_index::metrics::MetricsCollector;
+use lance_index::metrics::{
+    AND_CANDIDATES_PRUNED_BEFORE_RETURN_METRIC, AND_CANDIDATES_SEEN_METRIC, AND_FULL_SCORES_METRIC,
+    FREQS_COLLECTED_METRIC, MetricsCollector,
+};
 use lance_index::scalar::inverted::builder::ScoredDoc;
 use lance_index::scalar::inverted::builder::document_input;
 use lance_index::scalar::inverted::document_tokenizer::{DocType, JsonTokenizer, LanceTokenizer};
@@ -48,7 +51,7 @@ use lance_index::scalar::inverted::query::{
 use lance_index::scalar::inverted::tokenizer::document_tokenizer::TextTokenizer;
 use lance_index::scalar::inverted::{
     FTS_SCHEMA, InvertedIndex, MemBM25Scorer, SCORE_COL, build_global_bm25_scorer,
-    flat_bm25_search_stream_with_metrics,
+    flat_bm25_search_stream_with_metrics_and_operator,
 };
 use lance_index::{prefilter::PreFilter, scalar::inverted::query::BooleanQuery};
 use lance_tokenizer::{SimpleTokenizer, TextAnalyzer};
@@ -61,15 +64,16 @@ async fn open_fts_segment(
     segment: &IndexMetadata,
     metrics: &IndexMetrics,
 ) -> Result<Arc<InvertedIndex>> {
-    let uuid = segment.uuid.to_string();
-    let index = dataset.open_generic_index(column, &uuid, metrics).await?;
+    let index = dataset
+        .open_scalar_index(column, &segment.uuid, metrics)
+        .await?;
     let inverted = index
         .as_any()
         .downcast_ref::<InvertedIndex>()
         .ok_or_else(|| {
             Error::invalid_input(format!(
                 "Index for column {} and segment {} is not an inverted index",
-                column, uuid
+                column, segment.uuid
             ))
         })?;
     Ok(Arc::new(inverted.clone()))
@@ -93,7 +97,6 @@ async fn open_fts_segments(
     .await
 }
 
-#[instrument(name = "phase.index_search.fts", skip_all)]
 async fn search_segments(
     indices: &[Arc<InvertedIndex>],
     tokens: Arc<Tokens>,
@@ -132,7 +135,7 @@ async fn search_segments(
     let mut searches = searches;
 
     while let Some((doc_ids, scores)) = searches.try_next().await? {
-        for (row_id, score) in doc_ids.into_iter().zip(scores.into_iter()) {
+        for (row_id, score) in doc_ids.into_iter().zip(scores) {
             if candidates.len() < limit {
                 candidates.push(std::cmp::Reverse(ScoredDoc::new(row_id, score)));
             } else if candidates.peek().unwrap().0.score.0 < score {
@@ -159,6 +162,13 @@ fn default_text_tokenizer() -> Box<dyn LanceTokenizer> {
 pub struct FtsIndexMetrics {
     index_metrics: IndexMetrics,
     partitions_searched: Count,
+    and_candidates_seen: Count,
+    and_candidates_pruned_before_return: Count,
+    and_full_scores: Count,
+    freqs_collected: Count,
+    /// Wall time (ms) of the exec-local `build_global_bm25_scorer`
+    /// fallback; zero when a preset base scorer was injected.
+    scorer_build_ms: Gauge,
     baseline_metrics: BaselineMetrics,
 }
 
@@ -167,12 +177,22 @@ impl FtsIndexMetrics {
         Self {
             index_metrics: IndexMetrics::new(metrics, partition),
             partitions_searched: metrics.new_count(PARTITIONS_SEARCHED_METRIC, partition),
+            and_candidates_seen: metrics.new_count(AND_CANDIDATES_SEEN_METRIC, partition),
+            and_candidates_pruned_before_return: metrics
+                .new_count(AND_CANDIDATES_PRUNED_BEFORE_RETURN_METRIC, partition),
+            and_full_scores: metrics.new_count(AND_FULL_SCORES_METRIC, partition),
+            freqs_collected: metrics.new_count(FREQS_COLLECTED_METRIC, partition),
+            scorer_build_ms: metrics.new_gauge("scorer_build_ms", partition),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
         }
     }
 
     pub fn record_parts_searched(&self, num_parts: usize) {
         self.partitions_searched.add(num_parts);
+    }
+
+    pub fn record_scorer_build(&self, elapsed: std::time::Duration) {
+        self.scorer_build_ms.set(elapsed.as_millis() as usize);
     }
 }
 
@@ -187,6 +207,22 @@ impl MetricsCollector for FtsIndexMetrics {
 
     fn record_comparisons(&self, num_comparisons: usize) {
         self.index_metrics.record_comparisons(num_comparisons);
+    }
+
+    fn record_and_candidates_seen(&self, num_candidates: usize) {
+        self.and_candidates_seen.add(num_candidates);
+    }
+
+    fn record_and_candidates_pruned_before_return(&self, num_candidates: usize) {
+        self.and_candidates_pruned_before_return.add(num_candidates);
+    }
+
+    fn record_and_full_scores(&self, num_scores: usize) {
+        self.and_full_scores.add(num_scores);
+    }
+
+    fn record_freqs_collected(&self, num_collections: usize) {
+        self.freqs_collected.add(num_collections);
     }
 }
 
@@ -213,7 +249,7 @@ impl DisplayAs for MatchQueryExec {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
                     f,
-                    "MatchQuery: column={}, query={}",
+                    "MatchQuery: column={}, query=[{}]",
                     self.query.column.as_deref().unwrap_or_default(),
                     self.query.terms
                 )
@@ -345,10 +381,6 @@ impl MatchQueryExec {
 impl ExecutionPlan for MatchQueryExec {
     fn name(&self) -> &str {
         "MatchQueryExec"
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -497,7 +529,16 @@ impl ExecutionPlan for MatchQueryExec {
             let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
             let base_scorer = match preset_base_scorer {
                 Some(scorer) => scorer,
-                None => Arc::new(build_global_bm25_scorer(&indices, &tokens, &params)?),
+                None => {
+                    let scorer_start = std::time::Instant::now();
+                    let scorer = Arc::new(
+                        build_global_bm25_scorer(&indices, &tokens, &params)
+                            .boxed()
+                            .await?,
+                    );
+                    metrics.record_scorer_build(scorer_start.elapsed());
+                    scorer
+                }
             };
 
             pre_filter.wait_for_ready().await?;
@@ -696,11 +737,6 @@ impl FlatMatchFilterExec {
         metrics_set: ExecutionPlanMetricsSet,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let metrics = Arc::new(FtsIndexMetrics::new(&metrics_set, partition));
-        let elapsed_compute = metrics.baseline_metrics.elapsed_compute().clone();
-        // Time the one-shot setup (tokenizer load + query tokenization) so it's
-        // attributed to this node's elapsed_compute. The helper itself only
-        // times per-batch work.
-        let setup_start = std::time::Instant::now();
         let column = query
             .column
             .clone()
@@ -721,54 +757,51 @@ impl FlatMatchFilterExec {
             None => Self::load_tokenizer(&dataset, &column, &metrics.index_metrics).await?,
         };
         let query_tokens = Arc::new(collect_query_tokens(&query.terms, &mut tokenizer));
-        elapsed_compute.add_duration(setup_start.elapsed());
 
-        let helper = InstrumentedChildInputStream::new(
-            input,
-            schema,
-            move |batch| {
-                // Clone per-batch so the work runs *inside* the async block
-                // (i.e., during the helper's timed in_flight poll, not during
-                // its untimed input-pulling phase).
-                let column = column.clone();
-                let query_tokens = query_tokens.clone();
-                let mut tokenizer = tokenizer.box_clone();
-                async move {
-                    let text_column = batch.column_by_name(&column).ok_or_else(|| {
-                        DataFusionError::Execution(format!("Column {} not found in batch", column,))
-                    })?;
-                    let predicate = match text_column.data_type() {
-                        DataType::Utf8 => {
-                            Self::find_matches::<i32>(text_column, &mut tokenizer, &query_tokens)
-                        }
-                        DataType::LargeUtf8 => {
-                            Self::find_matches::<i64>(text_column, &mut tokenizer, &query_tokens)
-                        }
-                        _ => {
-                            return Err(DataFusionError::Execution(format!(
-                                "Column {} is not a string",
-                                column,
-                            )));
-                        }
-                    };
-                    Ok(arrow::compute::filter_record_batch(&batch, &predicate)?)
-                }
-            },
-            1,
-            partition,
-            &metrics_set,
-        );
-        Ok(Box::pin(helper))
+        let baseline = BaselineMetrics::new(&metrics_set, partition);
+        let elapsed_compute = baseline.elapsed_compute().clone();
+        let stream = input.then(move |batch_result| {
+            let column = column.clone();
+            let query_tokens = query_tokens.clone();
+            let mut tokenizer = tokenizer.box_clone();
+            let elapsed_compute = elapsed_compute.clone();
+            async move {
+                let batch = batch_result?;
+                let _t = elapsed_compute.timer();
+                let text_column = batch.column_by_name(&column).ok_or_else(|| {
+                    DataFusionError::Execution(format!("Column {} not found in batch", column,))
+                })?;
+                let predicate = match text_column.data_type() {
+                    DataType::Utf8 => {
+                        Self::find_matches::<i32>(text_column, &mut tokenizer, &query_tokens)
+                    }
+                    DataType::LargeUtf8 => {
+                        Self::find_matches::<i64>(text_column, &mut tokenizer, &query_tokens)
+                    }
+                    _ => {
+                        return Err(DataFusionError::Execution(format!(
+                            "Column {} is not a string",
+                            column,
+                        )));
+                    }
+                };
+                Ok(arrow::compute::filter_record_batch(&batch, &predicate)?)
+            }
+        });
+        let stream = stream.map(move |batch| {
+            let poll = baseline.record_poll(std::task::Poll::Ready(Some(batch)));
+            match poll {
+                std::task::Poll::Ready(Some(b)) => b,
+                _ => unreachable!("record_poll preserves Ready(Some) input"),
+            }
+        });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 }
 
 impl ExecutionPlan for FlatMatchFilterExec {
     fn name(&self) -> &str {
         "FlatMatchFilterExec"
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -822,7 +855,7 @@ impl ExecutionPlan for FlatMatchFilterExec {
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> DataFusionResult<Statistics> {
+    fn partition_statistics(&self, partition: Option<usize>) -> DataFusionResult<Arc<Statistics>> {
         self.input.partition_statistics(partition)
     }
 
@@ -963,12 +996,16 @@ impl ExecutionPlan for FlatMatchQueryExec {
         "FlatMatchQueryExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.unindexed_input]
+    }
+
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        // `execute()` only reads `unindexed_input.execute(partition)` for the single
+        // output partition, so the input must be coalesced to one partition. Without
+        // this, EnforceDistribution may round-robin the scan across `target_partitions`
+        // and only partition 0 is consumed, silently dropping the other fragments.
+        vec![Distribution::SinglePartition]
     }
 
     fn with_new_children(
@@ -1011,11 +1048,8 @@ impl ExecutionPlan for FlatMatchQueryExec {
         // so it can attribute the spawn_cpu tokenize work and synchronous
         // scoring back onto this node's `elapsed_compute`. Sharing the same
         // `Time` handle that's already inside the FtsIndexMetrics avoids
-        // registering a duplicate metric. Cloned once for use during setup
-        // timing (below) and again moved into the async block for the
-        // streaming-phase call.
+        // registering a duplicate metric.
         let elapsed_compute = metrics.baseline_metrics.elapsed_compute().clone();
-        let elapsed_compute_for_stream = elapsed_compute.clone();
 
         let column = query.column.ok_or(DataFusionError::Execution(format!(
             "column not set for MatchQuery {}",
@@ -1025,9 +1059,6 @@ impl ExecutionPlan for FlatMatchQueryExec {
             document_input(self.unindexed_input.execute(partition, context)?, &column)?;
 
         let stream = stream::once(async move {
-            // Time the one-shot setup (load segments / open indices / build
-            // scorer / acquire tokenizer) and attribute it to elapsed_compute.
-            let setup_start = std::time::Instant::now();
             let segments = match preset_segments {
                 Some(segments) => Some(segments),
                 None => load_segments(&ds, &column).await?,
@@ -1048,11 +1079,16 @@ impl ExecutionPlan for FlatMatchQueryExec {
                         Some(scorer) => (*scorer).clone(),
                         None => {
                             let query_tokens = collect_query_tokens(&query.terms, &mut tokenizer);
-                            build_global_bm25_scorer(
+                            let scorer_start = std::time::Instant::now();
+                            let scorer = build_global_bm25_scorer(
                                 &indices,
                                 &query_tokens,
                                 &FtsSearchParams::new(),
-                            )?
+                            )
+                            .boxed()
+                            .await?;
+                            metrics.record_scorer_build(scorer_start.elapsed());
+                            scorer
                         }
                     };
                     (tokenizer, Some(base_scorer))
@@ -1062,16 +1098,16 @@ impl ExecutionPlan for FlatMatchQueryExec {
                     preset_base_scorer.map(|s| (*s).clone()),
                 ),
             };
-            elapsed_compute.add_duration(setup_start.elapsed());
 
-            flat_bm25_search_stream_with_metrics(
+            flat_bm25_search_stream_with_metrics_and_operator(
                 unindexed_input,
                 column,
                 query.terms,
                 tokenizer,
                 base_scorer,
                 target_batch_size,
-                Some(elapsed_compute_for_stream),
+                query.operator,
+                Some(elapsed_compute),
             )
             .await
         })
@@ -1237,10 +1273,6 @@ impl ExecutionPlan for PhraseQueryExec {
         "PhraseQueryExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         match &self.prefilter_source {
             PreFilterSource::None => vec![],
@@ -1364,7 +1396,16 @@ impl ExecutionPlan for PhraseQueryExec {
             let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
             let base_scorer = match preset_base_scorer {
                 Some(scorer) => scorer,
-                None => Arc::new(build_global_bm25_scorer(&indices, &tokens, &params)?),
+                None => {
+                    let scorer_start = std::time::Instant::now();
+                    let scorer = Arc::new(
+                        build_global_bm25_scorer(&indices, &tokens, &params)
+                            .boxed()
+                            .await?,
+                    );
+                    metrics.record_scorer_build(scorer_start.elapsed());
+                    scorer
+                }
             };
 
             pre_filter.wait_for_ready().await?;
@@ -1484,10 +1525,6 @@ impl BoostQueryExec {
 impl ExecutionPlan for BoostQueryExec {
     fn name(&self) -> &str {
         "BoostQueryExec"
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -1752,10 +1789,6 @@ impl BooleanQueryExec {
 impl ExecutionPlan for BooleanQueryExec {
     fn name(&self) -> &str {
         "BooleanQueryExec"
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -2190,7 +2223,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let index = dataset
-            .open_generic_index("text", &index_meta.uuid.to_string(), &NoOpMetricsCollector)
+            .open_generic_index("text", &index_meta.uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
         let inverted_index = index.as_any().downcast_ref::<InvertedIndex>().unwrap();
@@ -2253,7 +2286,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let index = dataset
-            .open_generic_index("text", &index_meta.uuid.to_string(), &NoOpMetricsCollector)
+            .open_generic_index("text", &index_meta.uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
         let inverted_index = index.as_any().downcast_ref::<InvertedIndex>().unwrap();
@@ -2366,14 +2399,7 @@ mod tests {
                 .fragments(vec![fragment_id]);
             metadatas.push(builder.execute_uncommitted().await.unwrap());
         }
-        let segments = ds
-            .create_index_segment_builder()
-            .with_index_type(IndexType::Inverted)
-            .with_segments(metadatas.clone())
-            .build_all()
-            .await
-            .unwrap();
-        ds.commit_existing_index_segments("seg_fts", "text", segments)
+        ds.commit_existing_index_segments("seg_fts", "text", metadatas.clone())
             .await
             .unwrap();
         assert_eq!(
@@ -2423,8 +2449,11 @@ mod tests {
         );
         let mut tokenizer = indices[0].tokenizer();
         let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
-        let global_scorer =
-            Arc::new(build_global_bm25_scorer(&indices, &tokens, &search_params).unwrap());
+        let global_scorer = Arc::new(
+            build_global_bm25_scorer(&indices, &tokens, &search_params)
+                .await
+                .unwrap(),
+        );
 
         let override_exec = MatchQueryExec::new_with_segments(
             dataset.clone(),
@@ -2511,7 +2540,7 @@ mod tests {
             .unwrap()
             .expect("Should slot always returns Some");
         assert!(
-            plan.as_any().downcast_ref::<EmptyExec>().is_some(),
+            plan.downcast_ref::<EmptyExec>().is_some(),
             "expected EmptyExec for empty Should slot, got {plan:?}"
         );
     }
@@ -2539,12 +2568,10 @@ mod tests {
         .unwrap()
         .expect("Should slot always returns Some");
         let repartition = plan
-            .as_any()
             .downcast_ref::<RepartitionExec>()
             .expect("multi-child Should should be wrapped in RepartitionExec");
         let inner = repartition
             .input()
-            .as_any()
             .downcast_ref::<UnionExec>()
             .expect("RepartitionExec should wrap a UnionExec");
         assert_eq!(inner.children().len(), 2);
@@ -2583,7 +2610,7 @@ mod tests {
         // there are N-1 joins.
         let mut joins = 0usize;
         let mut current: Arc<dyn ExecutionPlan> = plan;
-        while let Some(join) = current.clone().as_any().downcast_ref::<HashJoinExec>() {
+        while let Some(join) = current.clone().downcast_ref::<HashJoinExec>() {
             joins += 1;
             current = join.children()[0].clone();
         }
@@ -2599,12 +2626,10 @@ mod tests {
         .unwrap()
         .expect("MustNot slot always returns Some");
         let repartition = plan
-            .as_any()
             .downcast_ref::<RepartitionExec>()
             .expect("multi-child MustNot should be wrapped in RepartitionExec");
         let inner = repartition
             .input()
-            .as_any()
             .downcast_ref::<UnionExec>()
             .expect("RepartitionExec should wrap a UnionExec");
         assert_eq!(inner.children().len(), 2);

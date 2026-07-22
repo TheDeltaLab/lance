@@ -1,0 +1,45 @@
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    versioning-strategy: lockfile-only
+    schedule:
+      interval: "weekly"
+      day: "wednesday"
+    groups:
+      cargo:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "cargo"
+    directory: "/python"
+    versioning-strategy: lockfile-only
+    schedule:
+      interval: "weekly"
+      day: "wednesday"
+    groups:
+      cargo:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "cargo"
+    directory: "/java/lance-jni"
+    versioning-strategy: lockfile-only
+    schedule:
+      interval: "weekly"
+      day: "wednesday"
+    groups:
+      cargo:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "uv"
+    directory: "/python"
+    versioning-strategy: lockfile-only
+    schedule:
+      interval: "weekly"
+      day: "wednesday"
+    groups:
+      uv:
+        patterns:
+          - "*"

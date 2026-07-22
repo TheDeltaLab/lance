@@ -223,21 +223,22 @@ use arrow_schema::{ArrowError, DataType, Field as ArrowField, Fields, Schema as 
 use bytes::Bytes;
 use futures::future::{BoxFuture, MaybeDone, maybe_done};
 use futures::stream::{self, BoxStream};
-use futures::{Future, FutureExt, StreamExt};
+use futures::{FutureExt, StreamExt};
 use lance_arrow::DataTypeExt;
-use lance_core::cache::LanceCache;
-use lance_core::datatypes::{BLOB_DESC_LANCE_FIELD, Field, Schema};
+use lance_core::cache::{Context, DeepSizeOf, LanceCache};
+use lance_core::datatypes::{
+    BLOB_DESC_LANCE_FIELD, Field, Schema, validate_fixed_size_list_dimensions,
+};
 use lance_core::utils::futures::{FinallyStreamExt, StreamOnDropExt};
 use lance_core::utils::parse::parse_env_as_bool;
-use lance_core::utils::tokio::{spawn_in_current_span, spawn_in_span};
-use lance_core::utils::tracing::{FutureTracingExt, StreamTracingExt};
 use log::{debug, trace, warn};
+use prost::Message;
 use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::{self, unbounded_channel};
 
 use lance_core::error::LanceOptionExt;
 use lance_core::{ArrowResult, Error, Result};
-use tracing::{Span, instrument};
+use tracing::instrument;
 
 use crate::compression::{DecompressionStrategy, DefaultDecompressionStrategy};
 use crate::data::DataBlock;
@@ -299,6 +300,15 @@ pub enum PageEncoding {
     Structural(pb21::PageLayout),
 }
 
+impl DeepSizeOf for PageEncoding {
+    fn deep_size_of_children(&self, _context: &mut Context) -> usize {
+        match self {
+            Self::Legacy(encoding) => encoding.encoded_len() * 4,
+            Self::Structural(encoding) => encoding.encoded_len() * 4,
+        }
+    }
+}
+
 impl PageEncoding {
     pub fn as_legacy(&self) -> &pb::ArrayEncoding {
         match self {
@@ -336,6 +346,13 @@ pub struct PageInfo {
     pub buffer_offsets_and_sizes: Arc<[(u64, u64)]>,
 }
 
+impl DeepSizeOf for PageInfo {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        self.encoding.deep_size_of_children(context)
+            + self.buffer_offsets_and_sizes.deep_size_of_children(context)
+    }
+}
+
 /// Metadata describing a column in a file
 ///
 /// This is typically created by reading the metadata section of a Lance file
@@ -348,6 +365,14 @@ pub struct ColumnInfo {
     /// File positions and their sizes of the column-level buffers
     pub buffer_offsets_and_sizes: Arc<[(u64, u64)]>,
     pub encoding: pb::ColumnEncoding,
+}
+
+impl DeepSizeOf for ColumnInfo {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        self.page_infos.deep_size_of_children(context)
+            + self.buffer_offsets_and_sizes.deep_size_of_children(context)
+            + self.encoding.encoded_len() * 4
+    }
 }
 
 impl ColumnInfo {
@@ -725,6 +750,7 @@ impl CoreFieldDecoderStrategy {
         column_infos: &mut ColumnInfoIter,
     ) -> Result<Box<dyn StructuralFieldScheduler>> {
         let data_type = field.data_type();
+        validate_fixed_size_list_dimensions(&field.name, &data_type)?;
         if Self::is_structural_primitive(&data_type) {
             let column_info = column_infos.expect_next()?;
             let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
@@ -834,6 +860,7 @@ impl CoreFieldDecoderStrategy {
         buffers: FileBuffers,
     ) -> Result<Box<dyn crate::previous::decoder::FieldScheduler>> {
         let data_type = field.data_type();
+        validate_fixed_size_list_dimensions(&field.name, &data_type)?;
         if Self::is_primitive_legacy(&data_type) {
             let column_info = column_infos.expect_next()?;
             let scheduler = self.create_primitive_scheduler(field, column_info, buffers)?;
@@ -1263,7 +1290,7 @@ impl DecodeBatchScheduler {
     /// * `ranges` - The ranges of rows to load
     /// * `sink` - A channel to send the decode tasks
     /// * `scheduler` An I/O scheduler to issue I/O requests
-    #[instrument(skip_all)]
+    #[instrument(level = "debug", skip_all)]
     pub fn schedule_ranges(
         &mut self,
         ranges: &[Range<u64>],
@@ -1299,7 +1326,7 @@ impl DecodeBatchScheduler {
     /// * `range` - The range of rows to load
     /// * `sink` - A channel to send the decode tasks
     /// * `scheduler` An I/O scheduler to issue I/O requests
-    #[instrument(skip_all)]
+    #[instrument(level = "debug", skip_all)]
     pub fn schedule_range(
         &mut self,
         range: Range<u64>,
@@ -1350,32 +1377,9 @@ impl DecodeBatchScheduler {
     }
 }
 
-pub type ReadBatchFut = BoxFuture<'static, Result<RecordBatch>>;
-pub type ReadBatchTaskStream = BoxStream<'static, ReadBatchTask>;
-pub type ReadBatchFutStream = BoxStream<'static, ReadBatchFut>;
-
 pub struct ReadBatchTask {
-    pub task: ReadBatchFut,
+    pub task: BoxFuture<'static, Result<RecordBatch>>,
     pub num_rows: u32,
-}
-
-impl ReadBatchTask {
-    pub fn from_future<F>(task: F, num_rows: u32) -> Self
-    where
-        F: Future<Output = Result<RecordBatch>> + Send + 'static,
-    {
-        Self::from_future_in_span(task, num_rows, Span::current())
-    }
-
-    pub fn from_future_in_span<F>(task: F, num_rows: u32, span: Span) -> Self
-    where
-        F: Future<Output = Result<RecordBatch>> + Send + 'static,
-    {
-        Self {
-            task: task.boxed_in_span(span),
-            num_rows,
-        }
-    }
 }
 
 /// A stream that takes scheduled jobs and generates decode tasks from them.
@@ -1503,45 +1507,44 @@ impl BatchDecodeStream {
     }
 
     pub fn into_stream(self) -> BoxStream<'static, ReadBatchTask> {
-        let stream_span = Span::current();
-        let stream = futures::stream::unfold(self, move |mut slf| {
-            let future_span = stream_span.clone();
-            let task_stream_span = stream_span.clone();
-            async move {
-                let next_task = slf.next_batch_task().await;
-                let next_task = next_task.transpose().map(|next_task| {
-                    let num_rows = next_task.as_ref().map(|t| t.num_rows).unwrap_or(0);
-                    let emitted_batch_size_warning = slf.emitted_batch_size_warning.clone();
-                    let task_span = task_stream_span.clone();
-                    let task = async move {
-                        let next_task = next_task?;
-                        // Real decode work happens inside into_batch, which can block the current
-                        // thread for a long time. By spawning it as a new task, we allow Tokio's
-                        // worker threads to keep making progress.
-                        let (batch, _data_size) = spawn_in_span(
-                            async move { next_task.into_batch(emitted_batch_size_warning) },
-                            task_span,
-                        )
+        let stream = futures::stream::unfold(self, |mut slf| async move {
+            let next_task = match slf.next_batch_task().await {
+                Ok(Some(next_task)) => next_task,
+                Ok(None) => return None,
+                Err(err) => {
+                    slf.rows_remaining = 0;
+                    return Some((
+                        ReadBatchTask {
+                            task: async move { Err(err) }.boxed(),
+                            num_rows: 0,
+                        },
+                        slf,
+                    ));
+                }
+            };
+            let num_rows = next_task.num_rows;
+            let emitted_batch_size_warning = slf.emitted_batch_size_warning.clone();
+            let task = async move {
+                // Real decode work happens inside into_batch, which can block the current
+                // thread for a long time. By spawning it as a new task, we allow Tokio's
+                // worker threads to keep making progress.
+                let (batch, _data_size) =
+                    tokio::spawn(async move { next_task.into_batch(emitted_batch_size_warning) })
                         .await
                         .map_err(|err| Error::wrapped(err.into()))??;
-                        Ok(batch)
-                    };
-                    (task, num_rows)
-                });
-                next_task.map(|(task, num_rows)| {
-                    // This should be true since batch size is u32
-                    debug_assert!(num_rows <= u32::MAX as u64);
-                    let next_task = ReadBatchTask::from_future_in_span(
-                        task,
-                        num_rows as u32,
-                        task_stream_span.clone(),
-                    );
-                    (next_task, slf)
-                })
-            }
-            .boxed_in_span(future_span)
+                Ok(batch)
+            };
+            // This should be true since batch size is u32
+            debug_assert!(num_rows <= u32::MAX as u64);
+            Some((
+                ReadBatchTask {
+                    task: task.boxed(),
+                    num_rows: num_rows as u32,
+                },
+                slf,
+            ))
         });
-        stream.boxed_stream_in_current_span()
+        stream.boxed()
     }
 }
 
@@ -1595,7 +1598,6 @@ struct BatchDecodeIterator<T: RootDecoderType> {
     rows_scheduled: u64,
     rows_drained: u64,
     emitted_batch_size_warning: Arc<Once>,
-    span: Span,
     // Note: this is not the runtime on which I/O happens.
     // That's always in the scheduler.  This is just a runtime we use to
     // sleep the current thread if I/O is unready
@@ -1623,7 +1625,6 @@ impl<T: RootDecoderType> BatchDecodeIterator<T> {
                 .build()
                 .unwrap(),
             emitted_batch_size_warning: Arc::new(Once::new()),
-            span: Span::current(),
             schema,
         }
     }
@@ -1646,7 +1647,7 @@ impl<T: RootDecoderType> BatchDecodeIterator<T> {
     ///
     /// Note that `scheduled_need` is cumulative.  E.g. this method
     /// should be called with 5, 10, 15 and not 5, 5, 5
-    #[instrument(skip_all)]
+    #[instrument(level = "debug", skip_all)]
     fn wait_for_io(&mut self, scheduled_need: u64, to_take: u64) -> Result<u64> {
         while self.rows_scheduled < scheduled_need && !self.messages.is_empty() {
             let message = self.messages.pop_front().unwrap()?;
@@ -1725,8 +1726,6 @@ impl<T: RootDecoderType> Iterator for BatchDecodeIterator<T> {
     type Item = ArrowResult<RecordBatch>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let span = self.span.clone();
-        let _guard = span.enter();
         self.next_batch_task()
             .transpose()
             .map(|r| r.map_err(ArrowError::from))
@@ -1920,66 +1919,63 @@ impl StructuralBatchDecodeStream {
     }
 
     pub fn into_stream(self) -> BoxStream<'static, ReadBatchTask> {
-        let stream_span = Span::current();
-        let stream = futures::stream::unfold(self, move |mut slf| {
-            let future_span = stream_span.clone();
-            let task_stream_span = stream_span.clone();
-            async move {
-                let next_task = slf.next_batch_task().await;
-                let next_task = next_task.transpose().map(|next_task| {
-                    let num_rows = next_task.as_ref().map(|t| t.num_rows).unwrap_or(0);
-                    let emitted_batch_size_warning = slf.emitted_batch_size_warning.clone();
-                    let bytes_per_row_feedback = slf.bytes_per_row_feedback.clone();
-                    // Capture the per-stream policy once so every emitted batch task follows the
-                    // same throughput-vs-overhead choice made by the scheduler.
-                    let spawn_batch_decode_tasks = slf.spawn_batch_decode_tasks;
-                    let task_span = task_stream_span.clone();
-                    let task = async move {
-                        let next_task = next_task?;
-                        let (batch, data_size) = if spawn_batch_decode_tasks {
-                            spawn_in_span(
-                                async move { next_task.into_batch(emitted_batch_size_warning) },
-                                task_span.clone(),
-                            )
-                            .await
-                            .map_err(|err| Error::wrapped(err.into()))??
-                        } else {
-                            next_task.into_batch(emitted_batch_size_warning)?
-                        };
-                        let num_rows = batch.num_rows() as u64;
-                        if num_rows > 0 {
-                            let bpr = data_size / num_rows;
-                            let prev = bytes_per_row_feedback.load(Ordering::Relaxed);
-                            let next = if prev == 0 || bpr >= prev {
-                                // First batch or actual size is larger than estimate:
-                                // adopt immediately to avoid OOM.
-                                bpr
-                            } else {
-                                // Actual size is smaller: degrade gradually toward
-                                // the true value to avoid over-correcting on a
-                                // single anomalous batch.
-                                (prev + bpr) / 2
-                            };
-                            bytes_per_row_feedback.store(next.max(1), Ordering::Relaxed);
-                        }
-                        Ok(batch)
+        let stream = futures::stream::unfold(self, |mut slf| async move {
+            let next_task = match slf.next_batch_task().await {
+                Ok(Some(next_task)) => next_task,
+                Ok(None) => return None,
+                Err(err) => {
+                    slf.rows_remaining = 0;
+                    return Some((
+                        ReadBatchTask {
+                            task: async move { Err(err) }.boxed(),
+                            num_rows: 0,
+                        },
+                        slf,
+                    ));
+                }
+            };
+            let num_rows = next_task.num_rows;
+            let emitted_batch_size_warning = slf.emitted_batch_size_warning.clone();
+            let bytes_per_row_feedback = slf.bytes_per_row_feedback.clone();
+            // Capture the per-stream policy once so every emitted batch task follows the
+            // same throughput-vs-overhead choice made by the scheduler.
+            let spawn_batch_decode_tasks = slf.spawn_batch_decode_tasks;
+            let task = async move {
+                let (batch, data_size) = if spawn_batch_decode_tasks {
+                    tokio::spawn(async move { next_task.into_batch(emitted_batch_size_warning) })
+                        .await
+                        .map_err(|err| Error::wrapped(err.into()))??
+                } else {
+                    next_task.into_batch(emitted_batch_size_warning)?
+                };
+                let num_rows = batch.num_rows() as u64;
+                if let Some(bpr) = data_size.checked_div(num_rows) {
+                    let prev = bytes_per_row_feedback.load(Ordering::Relaxed);
+                    let next = if prev == 0 || bpr >= prev {
+                        // First batch or actual size is larger than estimate:
+                        // adopt immediately to avoid OOM.
+                        bpr
+                    } else {
+                        // Actual size is smaller: degrade gradually toward
+                        // the true value to avoid over-correcting on a
+                        // single anomalous batch.
+                        (prev + bpr) / 2
                     };
-                    (task, num_rows)
-                });
-                next_task.map(|(task, num_rows)| {
-                    // This should be true since batch size is u32
-                    debug_assert!(num_rows <= u32::MAX as u64);
-                    let next_task = ReadBatchTask::from_future_in_span(
-                        task,
-                        num_rows as u32,
-                        task_stream_span.clone(),
-                    );
-                    (next_task, slf)
-                })
-            }
-            .boxed_in_span(future_span)
+                    bytes_per_row_feedback.store(next.max(1), Ordering::Relaxed);
+                }
+                Ok(batch)
+            };
+            // This should be true since batch size is u32
+            debug_assert!(num_rows <= u32::MAX as u64);
+            Some((
+                ReadBatchTask {
+                    task: task.boxed(),
+                    num_rows: num_rows as u32,
+                },
+                slf,
+            ))
         });
-        stream.boxed_stream_in_current_span()
+        stream.boxed()
     }
 }
 
@@ -2092,7 +2088,7 @@ fn check_scheduler_on_drop(
             // ScanScheduler to drop and cancel pending I/O.
             abort_handle.abort();
         })
-        .boxed_stream_in_current_span()
+        .boxed()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2252,7 +2248,7 @@ async fn create_scheduler_decoder(
                 }
             }
         };
-        let scheduler_handle = spawn_in_current_span(scheduling);
+        let scheduler_handle = tokio::task::spawn(scheduling);
         Ok(check_scheduler_on_drop(decode_stream, scheduler_handle))
     }
 }
@@ -2280,7 +2276,7 @@ pub async fn schedule_and_decode(
     config: SchedulerDecoderConfig,
 ) -> Result<BoxStream<'static, ReadBatchTask>> {
     if requested_rows.num_rows() == 0 {
-        return Ok(stream::empty().boxed_stream_in_current_span());
+        return Ok(stream::empty().boxed());
     }
 
     // If the user requested any ranges that are empty, ignore them.  They are pointless and
@@ -2301,9 +2297,7 @@ pub async fn schedule_and_decode(
 
     // Keep the io alive until the stream is dropped or finishes.  Otherwise the
     // I/O drops as soon as the scheduling is finished and the I/O loop terminates.
-    Ok(stream
-        .finally(move || drop(io))
-        .boxed_stream_in_current_span())
+    Ok(stream.finally(move || drop(io)).boxed())
 }
 
 pub static WAITER_RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
@@ -2723,8 +2717,9 @@ pub trait DecodeArrayTask: Send {
 
 impl DecodeArrayTask for Box<dyn StructuralDecodeArrayTask> {
     fn decode(self: Box<Self>) -> Result<(ArrayRef, u64)> {
-        StructuralDecodeArrayTask::decode(*self)
-            .map(|decoded_array| (decoded_array.array, decoded_array.data_size))
+        let decoded_array = StructuralDecodeArrayTask::decode(*self)?;
+        decoded_array.repdef.ensure_exhausted()?;
+        Ok((decoded_array.array, decoded_array.data_size))
     }
 }
 
@@ -2746,10 +2741,7 @@ impl NextDecodeTask {
     // suggesting the user try a smaller batch size.
     #[instrument(name = "task_to_batch", level = "debug", skip_all)]
     fn into_batch(self, emitted_batch_size_warning: Arc<Once>) -> Result<(RecordBatch, u64)> {
-        let (struct_arr, data_size) = self
-            .task
-            .decode()
-            .map_err(|e| Error::internal(format!("Error decoding batch: {}", e)))?;
+        let (struct_arr, data_size) = self.task.decode()?;
         let batch = RecordBatch::from(struct_arr.as_struct());
         if data_size > BATCH_SIZE_BYTES_WARNING {
             emitted_batch_size_warning.call_once(|| {
@@ -2934,6 +2926,219 @@ pub async fn decode_batch(
 // test coalesce indices to ranges
 mod tests {
     use super::*;
+    use crate::previous::decoder::{DecoderReady, LogicalPageDecoder};
+    use std::collections::VecDeque;
+
+    #[derive(Debug)]
+    struct FailingPageDecoder {
+        page_data_type: DataType,
+        total_rows: u64,
+        load_error_message: &'static str,
+    }
+
+    impl FailingPageDecoder {
+        fn new(
+            page_data_type: DataType,
+            total_rows: u64,
+            load_error_message: &'static str,
+        ) -> Self {
+            Self {
+                page_data_type,
+                total_rows,
+                load_error_message,
+            }
+        }
+    }
+
+    impl LogicalPageDecoder for FailingPageDecoder {
+        fn wait_for_loaded(&'_ mut self, _rows_needed: u64) -> BoxFuture<'_, Result<()>> {
+            let load_error_message = self.load_error_message;
+            async move { Err(Error::io(load_error_message)) }.boxed()
+        }
+
+        fn rows_loaded(&self) -> u64 {
+            0
+        }
+
+        fn num_rows(&self) -> u64 {
+            self.total_rows
+        }
+
+        fn rows_drained(&self) -> u64 {
+            0
+        }
+
+        fn drain(&mut self, requested_rows: u64) -> Result<NextDecodeTask> {
+            Err(Error::internal(format!(
+                "failing page decoder should not be drained after load error \
+                 (requested_rows={})",
+                requested_rows
+            )))
+        }
+
+        fn data_type(&self) -> &DataType {
+            &self.page_data_type
+        }
+    }
+
+    struct InvalidInputDecodeTask;
+
+    impl DecodeArrayTask for InvalidInputDecodeTask {
+        fn decode(self: Box<Self>) -> Result<(ArrayRef, u64)> {
+            Err(Error::invalid_input_source("malformed sparse page".into()))
+        }
+    }
+
+    #[test]
+    fn next_decode_task_preserves_invalid_input_errors() {
+        let err = NextDecodeTask {
+            task: Box::new(InvalidInputDecodeTask),
+            num_rows: 0,
+        }
+        .into_batch(Arc::new(Once::new()))
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }));
+    }
+
+    #[test]
+    fn test_read_zero_dimension_fsl_errors_instead_of_panicking() {
+        // Simulates reading a column whose stored schema declares a
+        // zero-dimension FixedSizeList, as old writers (before #5102) could
+        // persist. The read plan is built by the field-scheduler factories,
+        // which run the dimension guard before touching any column data, so
+        // an empty column iterator is sufficient to reach the guard. The read
+        // must surface a clean error rather than a divide-by-zero panic.
+        use arrow_schema::Field as ArrowField;
+
+        let zero_dim = DataType::FixedSizeList(
+            Arc::new(ArrowField::new("item", DataType::Float32, true)),
+            0,
+        );
+        let field = Field::try_from(&ArrowField::new("vec", zero_dim, true)).unwrap();
+        let strategy = CoreFieldDecoderStrategy::default();
+
+        let mut structural_columns = ColumnInfoIter::new(vec![], &[]);
+        let err = strategy
+            .create_structural_field_scheduler(&field, &mut structural_columns)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("dimension must be a positive integer"),
+            "unexpected error: {}",
+            err
+        );
+
+        let mut legacy_columns = ColumnInfoIter::new(vec![], &[]);
+        let err = strategy
+            .create_legacy_field_scheduler(
+                &field,
+                &mut legacy_columns,
+                FileBuffers {
+                    positions_and_sizes: &[],
+                },
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("dimension must be a positive integer"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_legacy_stream_stops_on_load_error() {
+        use arrow_schema::Field as ArrowField;
+
+        let rows_per_batch = 1;
+        let total_rows = 2;
+        let scheduled_rows = 1;
+        let page_rows = 1;
+        let batch_readahead = 2;
+        let load_error_message = "simulated page load failure";
+        let fields = Fields::from(vec![ArrowField::new("vector", DataType::Float32, true)]);
+        let root_decoder = SimpleStructDecoder::new(fields, total_rows);
+        let (tx, rx) = unbounded_channel();
+
+        tx.send(Ok(DecoderMessage {
+            scheduled_so_far: scheduled_rows,
+            decoders: vec![MessageType::DecoderReady(DecoderReady {
+                decoder: Box::new(FailingPageDecoder::new(
+                    DataType::Float32,
+                    page_rows,
+                    load_error_message,
+                )),
+                path: VecDeque::from([0]),
+            })],
+        }))
+        .unwrap();
+        drop(tx);
+
+        let stream =
+            BatchDecodeStream::new(rx, rows_per_batch, total_rows, root_decoder).into_stream();
+        let mut batches = stream.map(|task| task.task).buffered(batch_readahead);
+
+        let err = batches
+            .next()
+            .await
+            .expect("stream should emit the legacy page-load error")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains(load_error_message),
+            "unexpected error: {}",
+            err
+        );
+        assert!(
+            batches.next().await.is_none(),
+            "stream should stop after the legacy page-load error"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_structural_stream_stops_on_load_error() {
+        let rows_per_batch = 1;
+        let total_rows = 2;
+        let scheduled_rows = 1;
+        let batch_readahead = 2;
+        let load_error_message = "simulated page load failure";
+        let fields = Fields::from(vec![ArrowField::new("vector", DataType::Float32, true)]);
+        let root_decoder = StructuralStructDecoder::new(fields, false, /*is_root=*/ true).unwrap();
+        let (tx, rx) = unbounded_channel();
+        let failed_page = async move { Err(Error::io(load_error_message)) }.boxed();
+
+        tx.send(Ok(DecoderMessage {
+            scheduled_so_far: scheduled_rows,
+            decoders: vec![MessageType::UnloadedPage(UnloadedPageShard(failed_page))],
+        }))
+        .unwrap();
+        drop(tx);
+
+        let stream = StructuralBatchDecodeStream::new(
+            rx,
+            rows_per_batch,
+            total_rows,
+            root_decoder,
+            /*spawn_batch_decode_tasks=*/ true,
+            None,
+        )
+        .into_stream();
+        let mut batches = stream.map(|task| task.task).buffered(batch_readahead);
+
+        let err = batches
+            .next()
+            .await
+            .expect("stream should emit the page-load error")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains(load_error_message),
+            "unexpected error: {}",
+            err
+        );
+        assert!(
+            batches.next().await.is_none(),
+            "stream should stop after the page-load error"
+        );
+    }
 
     #[test]
     fn test_coalesce_indices_to_ranges_with_single_index() {

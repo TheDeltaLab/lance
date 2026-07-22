@@ -13,10 +13,7 @@ use arrow_array::{
 use arrow_schema::DataType;
 use futures::{FutureExt, future::BoxFuture};
 use lance_arrow::DataTypeExt;
-use lance_core::{
-    Error, Result,
-    utils::{tokio::spawn_in_current_span, tracing::FutureTracingExt},
-};
+use lance_core::{Error, Result};
 use std::collections::HashMap;
 
 use crate::buffer::LanceBuffer;
@@ -90,7 +87,7 @@ impl PageScheduler for DictionaryPageScheduler {
         let copy_size = self.num_dictionary_items as u64;
 
         if self.should_decode_dict {
-            spawn_in_current_span(async move {
+            tokio::spawn(async move {
                 let items_decoder: Arc<dyn PrimitivePageDecoder> =
                     Arc::from(items_page_decoder.await?);
 
@@ -114,10 +111,10 @@ impl PageScheduler for DictionaryPageScheduler {
                 }) as Box<dyn PrimitivePageDecoder>)
             })
             .map(|join_handle| join_handle.unwrap())
-            .boxed_in_current_span()
+            .boxed()
         } else {
             let num_dictionary_items = self.num_dictionary_items;
-            spawn_in_current_span(async move {
+            tokio::spawn(async move {
                 let items_decoder: Arc<dyn PrimitivePageDecoder> =
                     Arc::from(items_page_decoder.await?);
 
@@ -133,7 +130,7 @@ impl PageScheduler for DictionaryPageScheduler {
                 }) as Box<dyn PrimitivePageDecoder>)
             })
             .map(|join_handle| join_handle.unwrap())
-            .boxed_in_current_span()
+            .boxed()
         }
     }
 }

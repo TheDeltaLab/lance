@@ -3,7 +3,7 @@
 
 use async_trait::async_trait;
 use chrono::prelude::*;
-use deepsize::DeepSizeOf;
+use lance_core::deepsize::DeepSizeOf;
 use lance_file::datatypes::{Fields, FieldsWithMeta, populate_schema_dictionary};
 use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_file::version::{LEGACY_FORMAT_VERSION, LanceFileVersion};
@@ -588,7 +588,7 @@ impl BasePath {
 }
 
 impl DeepSizeOf for BasePath {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.name.deep_size_of_children(context)
             + self.path.deep_size_of_children(context) * 2
             + size_of::<bool>()
@@ -900,7 +900,7 @@ impl TryFrom<pb::Manifest> for Manifest {
             Some(format) => DataStorageFormat::from(format),
         };
 
-        let schema = Schema::from(fields_with_meta);
+        let schema = Schema::try_from(fields_with_meta)?;
 
         Ok(Self {
             schema,
@@ -1316,6 +1316,7 @@ mod tests {
                     vec![0, 1, 2],
                     None,
                 )],
+                overlays: vec![],
                 deletion_file: None,
                 row_id_meta: None,
                 physical_rows: None,
@@ -1328,6 +1329,7 @@ mod tests {
                     DataFile::new_legacy_from_fields("path2", vec![0, 1, 43], None),
                     DataFile::new_legacy_from_fields("path3", vec![2], None),
                 ],
+                overlays: vec![],
                 deletion_file: None,
                 row_id_meta: None,
                 physical_rows: None,

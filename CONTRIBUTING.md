@@ -19,11 +19,21 @@ If you have any questions, please join our [Discord](https://discord.gg/zMM32dvN
 Currently Lance is implemented in Rust and comes with a Python wrapper. So you'll want to make sure you setup both.
 
 1. Install Rust: https://www.rust-lang.org/tools/install
-2. Install Python 3.9+: https://www.python.org/downloads/
+2. Install Python 3.10+: https://www.python.org/downloads/
 3. Install protoctol buffers: https://grpc.io/docs/protoc-installation/ (make sure you have version 3.20 or higher)
 4. Install commit hooks:
     a. Install pre-commit: https://pre-commit.com/#install
     b. Run `pre-commit install` in the root of the repo
+
+## Building for legacy x86_64 hosts (pre-Haswell)
+
+The default workspace build targets `haswell` (AVX2 + FMA + F16C), matching the published wheels. To build a binary that runs on pre-Haswell silicon (Sandy Bridge / Ivy Bridge / Westmere on Intel, Bulldozer / Piledriver / Steamroller on AMD — i.e. CPUs without AVX2), set the baseline yourself at build time:
+
+```sh
+RUSTFLAGS="-C target-cpu=x86-64-v2" cargo build --release
+```
+
+Runtime SIMD dispatch in `lance-linalg::distance` will then pick the appropriate tier (scalar / AVX / AVX+FMA / AVX2+FMA / AVX-512) based on the host. From Python, use `lance.simd_info()` to verify which tier was selected.
 
 ## Sample Workflow
 

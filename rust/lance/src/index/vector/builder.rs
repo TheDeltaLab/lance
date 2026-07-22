@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::{collections::HashMap, pin::Pin};
@@ -69,6 +70,7 @@ use lance_io::stream::RecordBatchStream;
 use lance_io::{object_store::ObjectStore, stream::RecordBatchStreamAdapter};
 use lance_linalg::distance::{DistanceType, Dot, L2, Normalize};
 use lance_linalg::kernels::normalize_fsl;
+use lance_table::format::IndexFile;
 use log::info;
 use object_store::path::Path;
 use prost::Message;
@@ -170,6 +172,11 @@ type BuildStream<S, Q> =
     Pin<Box<dyn Stream<Item = Result<Option<(<Q as Quantization>::Storage, S, f64)>>> + Send>>;
 
 type UnindexedStream = Box<dyn Stream<Item = Result<RecordBatch>> + Send + Unpin + 'static>;
+
+pub struct VectorIndexBuildSummary {
+    pub indices_merged: usize,
+    pub files: Vec<IndexFile>,
+}
 
 impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> {
     #[allow(clippy::too_many_arguments)]
@@ -282,9 +289,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         })
     }
 
-    // build the index with the all data in the dataset,
-    // return the number of indices merged
-    pub async fn build(&mut self) -> Result<usize> {
+    // build the index and return the files created by the writer.
+    pub async fn build(&mut self) -> Result<VectorIndexBuildSummary> {
         let progress = self.progress.clone();
 
         // step 1. train IVF & quantizer
@@ -318,13 +324,16 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             .stage_start("merge_partitions", num_partitions, "partitions")
             .await?;
         let build_idx_stream = self.build_partitions().boxed().await?;
-        self.merge_partitions(build_idx_stream).await?;
+        let files = self.merge_partitions(build_idx_stream).await?;
         progress.stage_complete("merge_partitions").await?;
 
-        Ok(self.merged_num)
+        Ok(VectorIndexBuildSummary {
+            indices_merged: self.merged_num,
+            files,
+        })
     }
 
-    pub async fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+    pub async fn remap(&mut self, mapping: &RowAddrRemap) -> Result<Vec<IndexFile>> {
         if self.existing_indices.is_empty() {
             return Err(Error::invalid_input(
                 "No existing indices available for remapping",
@@ -359,13 +368,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 }
             });
 
-        self.merge_partitions(
-            stream::iter(build_iter)
-                .buffered(get_num_compute_intensive_cpus())
-                .boxed(),
-        )
-        .await?;
-        Ok(())
+        let files = self
+            .merge_partitions(
+                stream::iter(build_iter)
+                    .buffered(get_num_compute_intensive_cpus())
+                    .boxed(),
+            )
+            .await?;
+        Ok(files)
     }
 
     pub fn with_ivf(&mut self, ivf: IvfModel) -> &mut Self {
@@ -385,7 +395,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
     /// Set fragment filter for distributed indexing
     pub fn with_fragment_filter(&mut self, fragment_ids: Vec<u32>) -> &mut Self {
-        self.fragment_filter = Some(fragment_ids);
+        self.fragment_filter = Some(Dataset::normalize_fragment_ids(&fragment_ids));
+        self
+    }
+
+    pub fn with_optional_fragment_filter(&mut self, fragment_ids: Option<&[u32]>) -> &mut Self {
+        if let Some(fragment_ids) = fragment_ids {
+            self.fragment_filter = Some(Dataset::normalize_fragment_ids(fragment_ids));
+        }
         self
     }
 
@@ -543,19 +560,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             return Ok(None);
         };
         match &self.fragment_filter {
-            Some(fragment_ids) => {
-                let fragments: Vec<_> = dataset
-                    .get_fragments()
-                    .into_iter()
-                    .filter(|f| fragment_ids.contains(&(f.id() as u32)))
-                    .collect();
-                let counts = futures::stream::iter(fragments)
-                    .map(|f| async move { f.count_rows(None).await })
-                    .buffer_unordered(16) // ref: Dataset::count_all_rows()
-                    .try_collect::<Vec<_>>()
-                    .await?;
-                Ok(Some(counts.iter().sum::<usize>() as u64))
-            }
+            Some(fragment_ids) => Ok(Some(
+                dataset
+                    .count_rows_in_existing_fragments(fragment_ids)
+                    .await? as u64,
+            )),
             None => Ok(Some(dataset.count_rows(None).await? as u64)),
         }
     }
@@ -593,14 +602,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                         "applying fragment filter for distributed indexing: {:?}",
                         fragment_ids
                     );
-                    // Filter fragments by converting fragment_ids to Fragment objects
-                    let all_fragments = dataset.fragments();
-                    let filtered_fragments: Vec<_> = all_fragments
-                        .iter()
-                        .filter(|fragment| fragment_ids.contains(&(fragment.id as u32)))
-                        .cloned()
-                        .collect();
-                    builder.with_fragments(filtered_fragments);
+                    builder.with_fragments(
+                        dataset.get_existing_fragment_metadata_from_ids(fragment_ids),
+                    );
                 }
 
                 let (vector_type, _) = get_vector_type(dataset.schema(), &self.column)?;
@@ -1036,7 +1040,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 continue;
             }
 
-            let part_storage = existing_index.load_partition_storage(part_id).await?;
+            let part_storage = existing_index.load_partition_storage(part_id, None).await?;
             let mut part_batches = part_storage.to_batches()?.collect::<Vec<_>>();
             // for PQ, the PQ codes are transposed, so we need to transpose them back
             match Q::quantization_type() {
@@ -1108,7 +1112,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
     }
 
     #[instrument(name = "merge_partitions", level = "debug", skip_all)]
-    async fn merge_partitions(&mut self, mut build_stream: BuildStream<S, Q>) -> Result<()> {
+    async fn merge_partitions(
+        &mut self,
+        mut build_stream: BuildStream<S, Q>,
+    ) -> Result<Vec<IndexFile>> {
         let Some(ivf) = self.ivf.as_ref() else {
             return Err(Error::invalid_input("IVF not set before merge partitions"));
         };
@@ -1347,12 +1354,21 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             serde_json::to_string(&partition_index_metadata)?,
         );
 
-        storage_writer.finish().await?;
-        index_writer.finish().await?;
+        let storage_summary = storage_writer.finish().await?;
+        let index_summary = index_writer.finish().await?;
 
         log::info!("merging {} partitions done", ivf.num_partitions());
 
-        Ok(())
+        Ok(vec![
+            IndexFile {
+                path: INDEX_AUXILIARY_FILE_NAME.to_string(),
+                size_bytes: storage_summary.size_bytes,
+            },
+            IndexFile {
+                path: INDEX_FILE_NAME.to_string(),
+                size_bytes: index_summary.size_bytes,
+            },
+        ])
     }
 
     // take raw vectors from the dataset
@@ -2371,7 +2387,7 @@ mod tests {
 
         let indices = dataset.load_indices_by_name("idx").await.unwrap();
         let initial_index = dataset
-            .open_vector_index("vec", &indices[0].uuid.to_string(), &NoOpMetricsCollector)
+            .open_vector_index("vec", &indices[0].uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
         let initial_ivf = initial_index.ivf_model();
@@ -2401,7 +2417,7 @@ mod tests {
         let indices = dataset.load_indices_by_name("idx").await.unwrap();
         assert_eq!(indices.len(), 1, "expected merge-all on split");
         let optimized = dataset
-            .open_vector_index("vec", &indices[0].uuid.to_string(), &NoOpMetricsCollector)
+            .open_vector_index("vec", &indices[0].uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
         let ivf = optimized.ivf_model();

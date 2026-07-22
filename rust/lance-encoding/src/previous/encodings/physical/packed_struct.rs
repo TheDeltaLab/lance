@@ -8,10 +8,7 @@ use bytes::Bytes;
 use bytes::BytesMut;
 use futures::{FutureExt, future::BoxFuture};
 use lance_arrow::DataTypeExt;
-use lance_core::{
-    Error, Result,
-    utils::{tokio::spawn_in_current_span, tracing::FutureTracingExt},
-};
+use lance_core::{Error, Result};
 
 use crate::data::BlockInfo;
 use crate::data::FixedSizeListBlock;
@@ -84,7 +81,7 @@ impl PageScheduler for PackedStructPageScheduler {
 
         let copy_struct_fields = self.fields.clone();
 
-        spawn_in_current_span(async move {
+        tokio::spawn(async move {
             let bytes = bytes.await?;
 
             let mut combined_bytes = BytesMut::default();
@@ -99,7 +96,7 @@ impl PageScheduler for PackedStructPageScheduler {
             }) as Box<dyn PrimitivePageDecoder>)
         })
         .map(|join_handle| join_handle.unwrap())
-        .boxed_in_current_span()
+        .boxed()
     }
 }
 

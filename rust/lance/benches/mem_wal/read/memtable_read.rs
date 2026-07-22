@@ -46,7 +46,7 @@ use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::builder::PQBuildParams;
 use lance_linalg::distance::{DistanceType, MetricType};
 #[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
+use lance_testing::pprof::{Output, PProfProfiler};
 use rand::Rng;
 use uuid::Uuid;
 
@@ -224,6 +224,7 @@ async fn setup_lance(batches: Vec<RecordBatch>) -> LanceSetup {
 
     let uri = format!("memory://lance_bench_{}", Uuid::new_v4());
     let write_params = WriteParams {
+        data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
         max_rows_per_file: total_rows + 1,
         ..Default::default()
     };
@@ -246,6 +247,7 @@ async fn setup_lance_per_batch(batches: Vec<RecordBatch>, batch_size: usize) -> 
 
     let uri = format!("memory://lance_per_batch_{}", Uuid::new_v4());
     let write_params = WriteParams {
+        data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
         max_rows_per_file: batch_size,
         ..Default::default()
     };
@@ -268,6 +270,7 @@ async fn setup_lance_with_fts(batches: Vec<RecordBatch>) -> LanceSetup {
 
     let uri = format!("memory://lance_fts_bench_{}", Uuid::new_v4());
     let write_params = WriteParams {
+        data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
         max_rows_per_file: total_rows + 1,
         ..Default::default()
     };
@@ -300,6 +303,7 @@ async fn setup_lance_per_batch_with_fts(
 
     let uri = format!("memory://lance_fts_per_batch_{}", Uuid::new_v4());
     let write_params = WriteParams {
+        data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
         max_rows_per_file: batch_size,
         ..Default::default()
     };
@@ -333,6 +337,7 @@ async fn setup_lance_with_vector_index(
 
     let uri = format!("memory://lance_vec_bench_{}", Uuid::new_v4());
     let write_params = WriteParams {
+        data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
         max_rows_per_file: total_rows + 1,
         ..Default::default()
     };
@@ -379,6 +384,7 @@ async fn setup_lance_per_batch_with_vector_index(
 
     let uri = format!("memory://lance_vec_per_batch_{}", Uuid::new_v4());
     let write_params = WriteParams {
+        data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
         max_rows_per_file: batch_size,
         ..Default::default()
     };
@@ -767,8 +773,14 @@ fn bench_fts(c: &mut Criterion) {
                 async move {
                     let mut total_found = 0usize;
                     for (mut scanner, term) in scanners.into_iter().zip(terms.iter()) {
+                        scanner
+                            .full_text_search(
+                                FullTextSearchQuery::new(term.to_string())
+                                    .with_column("text".to_string())
+                                    .unwrap(),
+                            )
+                            .unwrap();
                         let batches: Vec<RecordBatch> = scanner
-                            .full_text_search("text", term)
                             .try_into_stream()
                             .await
                             .unwrap()
@@ -941,11 +953,14 @@ fn bench_vector_search(c: &mut Criterion) {
             let query_array: Arc<dyn arrow_array::Array> = Arc::new(Float32Array::from(q.clone()));
             b.to_async(&rt).iter(|| {
                 let query_array = query_array.clone();
-                async {
+                let memtable = &memtable;
+                async move {
                     let mut scanner = memtable.scan();
+                    scanner
+                        .nearest("vector", query_array.as_ref(), k)
+                        .unwrap()
+                        .nprobes(8);
                     let batches: Vec<RecordBatch> = scanner
-                        .nearest("vector", query_array, k)
-                        .nprobes(8)
                         .try_into_stream()
                         .await
                         .unwrap()

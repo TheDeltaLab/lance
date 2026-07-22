@@ -12,6 +12,7 @@ use crate::{Dataset, index};
 use async_trait::async_trait;
 use lance_core::Error;
 use lance_core::utils::address::RowAddress;
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragDigest};
 use lance_table::format::{Fragment, IndexFile, IndexMetadata};
 use lance_table::io::manifest::read_manifest_indexes;
@@ -51,7 +52,7 @@ pub struct RemappedIndex {
 pub trait IndexRemapper: Send + Sync {
     async fn remap_indices(
         &self,
-        index_map: HashMap<u64, Option<u64>>,
+        index_map: RowAddrRemap,
         affected_fragment_ids: &[u64],
     ) -> Result<Vec<RemappedIndex>>;
 }
@@ -69,11 +70,7 @@ pub struct IgnoreRemap {}
 
 #[async_trait]
 impl IndexRemapper for IgnoreRemap {
-    async fn remap_indices(
-        &self,
-        _: HashMap<u64, Option<u64>>,
-        _: &[u64],
-    ) -> Result<Vec<RemappedIndex>> {
+    async fn remap_indices(&self, _: RowAddrRemap, _: &[u64]) -> Result<Vec<RemappedIndex>> {
         Ok(Vec::new())
     }
 }
@@ -220,25 +217,37 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
         return Ok(());
     }
 
-    // Sequentially apply the row addr maps from oldest to latest
-    let mut curr_index_id = *index_id;
-    for (i, row_id_map) in frag_reuse_index.row_id_maps.iter().enumerate() {
-        let version = &frag_reuse_index.details.versions[i];
-        // load on-disk index metadata before auto-remap
-        let curr_index_meta = read_manifest_indexes(
-            &dataset.object_store,
-            &dataset.manifest_location,
-            &dataset.manifest,
-        )
-        .await?
-        .into_iter()
-        .find(|idx| idx.uuid == curr_index_id)
-        .unwrap();
+    // Read the index's on-disk metadata once. Its stored row addresses are at
+    // this baseline; we compose all reuse versions into a single remap so the
+    // index file is rebuilt and committed exactly once, rather than once per
+    // version (the reuse index can accumulate many versions before remap runs).
+    let curr_index_meta = read_manifest_indexes(
+        &dataset.object_store,
+        &dataset.manifest_location,
+        &dataset.manifest,
+    )
+    .await?
+    .into_iter()
+    .find(|idx| idx.uuid == *index_id)
+    .ok_or_else(|| {
+        Error::index(format!(
+            "index {index_id} not found in manifest; it may have been concurrently dropped"
+        ))
+    })?;
 
-        let maybe_index_bitmap = curr_index_meta.fragment_bitmap.clone();
-        let (should_remap, bitmap_after_remap) = match maybe_index_bitmap {
-            Some(mut index_frag_bitmap) => {
-                let mut should_remap = false;
+    // Compose the coverage (fragment bitmap) remap across every reuse version in
+    // one pass. Chaining is automatic: a version inserts its new fragments,
+    // which a later version then sees as its old fragments. `data_predates_version`
+    // is evaluated against the fixed baseline (there are no intermediate
+    // commits), and the new-fragment branch handles a bitmap that was already
+    // coverage-remapped + persisted before the data was remapped (e.g. while
+    // remapping a *sibling* index).
+    let baseline_version = curr_index_meta.dataset_version;
+    let (should_remap, bitmap_after_remap) = match curr_index_meta.fragment_bitmap.clone() {
+        Some(mut index_frag_bitmap) => {
+            let mut should_remap = false;
+            for version in frag_reuse_index.details.versions.iter() {
+                let data_predates_version = baseline_version < version.dataset_version;
                 for group in version.groups.iter() {
                     let mut old_frag_in_index = 0;
                     for old_frag in group.old_frags.iter() {
@@ -258,67 +267,98 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
                                 group.old_frags
                             )));
                         }
-                        index_frag_bitmap
-                            .extend(group.new_frags.clone().into_iter().map(|f| f.id as u32));
+                        index_frag_bitmap.extend(group.new_frags.iter().map(|f| f.id as u32));
+                        should_remap = true;
+                    } else if data_predates_version
+                        && group
+                            .new_frags
+                            .iter()
+                            .any(|new_frag| index_frag_bitmap.contains(new_frag.id as u32))
+                    {
+                        // The bitmap was already coverage-remapped onto this
+                        // group's new fragments and persisted before the data was
+                        // remapped, so the old fragments are gone from the bitmap
+                        // but the index data still needs remapping.
                         should_remap = true;
                     }
                 }
-                (should_remap, Some(index_frag_bitmap))
             }
-            // if there is no fragment bitmap for the index,
-            // we attempt remapping but will not update the fragment bitmap.
-            None => (true, None),
-        };
-
-        if should_remap {
-            let remap_result = index::remap_index(dataset, &curr_index_id, row_id_map).await?;
-
-            let new_index_meta = match remap_result {
-                RemapResult::Drop => continue,
-                RemapResult::Keep(new_id) => IndexMetadata {
-                    uuid: new_id,
-                    name: curr_index_meta.name.clone(),
-                    fields: curr_index_meta.fields.clone(),
-                    dataset_version: dataset.manifest.version,
-                    fragment_bitmap: bitmap_after_remap,
-                    index_details: curr_index_meta.index_details.clone(),
-                    index_version: curr_index_meta.index_version,
-                    created_at: curr_index_meta.created_at,
-                    base_id: None,
-                    files: curr_index_meta.files.clone(),
-                },
-                RemapResult::Remapped(remapped_index) => IndexMetadata {
-                    uuid: remapped_index.new_id,
-                    name: curr_index_meta.name.clone(),
-                    fields: curr_index_meta.fields.clone(),
-                    dataset_version: dataset.manifest.version,
-                    fragment_bitmap: bitmap_after_remap,
-                    index_details: Some(Arc::new(remapped_index.index_details)),
-                    index_version: remapped_index.index_version as i32,
-                    created_at: curr_index_meta.created_at,
-                    base_id: None,
-                    files: remapped_index.files,
-                },
-            };
-
-            let new_id = new_index_meta.uuid;
-
-            let transaction = Transaction::new(
-                dataset.manifest.version,
-                Operation::CreateIndex {
-                    new_indices: vec![new_index_meta],
-                    removed_indices: vec![curr_index_meta.clone()],
-                },
-                None,
-            );
-
-            dataset
-                .apply_commit(transaction, &Default::default(), &Default::default())
-                .await?;
-
-            curr_index_id = new_id;
+            (should_remap, Some(index_frag_bitmap))
         }
+        // if there is no fragment bitmap for the index,
+        // we attempt remapping but will not update the fragment bitmap.
+        None => (true, None),
+    };
+
+    if !should_remap {
+        return Ok(());
     }
+
+    // Compose the row-address remap across all versions. `remap_row_id` already
+    // chains every version (and passes through addresses a version does not
+    // touch), so mapping the union of all versions' keys yields a single
+    // baseline -> final address map applied in one rebuild.
+    //
+    // Map every old address; do NOT filter by the current `fragment_bitmap`. In
+    // the sibling-coverage-remap case the bitmap was already advanced onto the
+    // new fragments while the index data still holds old addresses, so filtering
+    // by it would drop exactly the keys this index needs and leave its data
+    // stale (an empty map makes `index::remap_index` return `Keep`). The map is
+    // bounded by the rows the reuse index touched; addresses this index does not
+    // store are simply never looked up.
+    let composed_row_id_map: HashMap<u64, Option<u64>> = frag_reuse_index
+        .row_id_maps
+        .iter()
+        .flat_map(|row_id_map| row_id_map.keys().copied())
+        .map(|old_addr| (old_addr, frag_reuse_index.remap_row_id(old_addr)))
+        .collect();
+
+    let remapper = RowAddrRemap::direct(composed_row_id_map);
+    let remap_result = index::remap_index(dataset, index_id, &remapper).await?;
+
+    let new_index_meta = match remap_result {
+        // The composed remap emptied the index (every row deleted). Matching the
+        // prior per-version behavior, leave the existing index untouched and
+        // commit nothing -- there is no remap to apply.
+        RemapResult::Drop => return Ok(()),
+        RemapResult::Keep(new_id) => IndexMetadata {
+            uuid: new_id,
+            name: curr_index_meta.name.clone(),
+            fields: curr_index_meta.fields.clone(),
+            dataset_version: dataset.manifest.version,
+            fragment_bitmap: bitmap_after_remap,
+            index_details: curr_index_meta.index_details.clone(),
+            index_version: curr_index_meta.index_version,
+            created_at: curr_index_meta.created_at,
+            base_id: None,
+            files: curr_index_meta.files.clone(),
+        },
+        RemapResult::Remapped(remapped_index) => IndexMetadata {
+            uuid: remapped_index.new_id,
+            name: curr_index_meta.name.clone(),
+            fields: curr_index_meta.fields.clone(),
+            dataset_version: dataset.manifest.version,
+            fragment_bitmap: bitmap_after_remap,
+            index_details: Some(Arc::new(remapped_index.index_details)),
+            index_version: remapped_index.index_version as i32,
+            created_at: curr_index_meta.created_at,
+            base_id: None,
+            files: remapped_index.files,
+        },
+    };
+
+    let transaction = Transaction::new(
+        dataset.manifest.version,
+        Operation::CreateIndex {
+            new_indices: vec![new_index_meta],
+            removed_indices: vec![curr_index_meta],
+        },
+        None,
+    );
+
+    dataset
+        .apply_commit(transaction, &Default::default(), &Default::default())
+        .await?;
 
     Ok(())
 }
@@ -368,6 +408,87 @@ pub async fn remap_column_index(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_compact_matches_transpose() {
+        use lance_core::utils::row_addr_remap::GroupInput;
+        // Ascending old fragments (compaction's scan order), with deletions.
+        let old = vec![
+            FragDigest {
+                id: 0,
+                physical_rows: 5,
+                num_deleted_rows: 2,
+            },
+            FragDigest {
+                id: 1,
+                physical_rows: 4,
+                num_deleted_rows: 1,
+            },
+            FragDigest {
+                id: 3,
+                physical_rows: 3,
+                num_deleted_rows: 0,
+            },
+        ];
+        // 9 rewritten rows (offsets that survived in each old fragment).
+        let rewritten = [
+            (0, 1),
+            (0, 2),
+            (0, 4),
+            (1, 0),
+            (1, 1),
+            (1, 3),
+            (3, 0),
+            (3, 1),
+            (3, 2),
+        ];
+        let addrs = RoaringTreemap::from_iter(
+            rewritten
+                .iter()
+                .map(|(f, o)| u64::from(RowAddress::new_from_parts(*f, *o))),
+        );
+        // 9 rewritten rows split across two new fragments.
+        let new = vec![
+            FragDigest {
+                id: 10,
+                physical_rows: 4,
+                num_deleted_rows: 0,
+            },
+            FragDigest {
+                id: 11,
+                physical_rows: 5,
+                num_deleted_rows: 0,
+            },
+        ];
+
+        let expected = transpose_row_ids_from_digest(addrs.clone(), &old, &new);
+        let compact = RowAddrRemap::compact([GroupInput {
+            rewritten_old_row_addrs: addrs,
+            old_frag_ids: old.iter().map(|f| f.id as u32).collect(),
+            new_frags: new
+                .iter()
+                .map(|f| (f.id as u32, f.physical_rows as u32))
+                .collect(),
+        }])
+        .unwrap();
+
+        // Every real address in the old fragments must map identically.
+        for f in &old {
+            for o in 0..f.physical_rows as u32 {
+                let a = u64::from(RowAddress::new_from_parts(f.id as u32, o));
+                assert_eq!(
+                    compact.get(a),
+                    expected.get(&a).copied(),
+                    "mismatch at ({}, {})",
+                    f.id,
+                    o
+                );
+            }
+        }
+        // A fragment outside the group is unaffected by both.
+        let outside = u64::from(RowAddress::new_from_parts(99, 0));
+        assert_eq!(compact.get(outside), expected.get(&outside).copied());
+    }
 
     #[test]
     fn test_missing_indices() {

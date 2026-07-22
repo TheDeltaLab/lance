@@ -14,6 +14,7 @@ from typing import (
     Any,
     Callable,
     Dict,
+    Iterable,
     Iterator,
     List,
     Literal,
@@ -44,6 +45,7 @@ if TYPE_CHECKING:
         ColumnOrdering,
         DatasetBasePath,
         LanceDataset,
+        LanceOperation,
         LanceScanner,
         ReaderLike,
         Transaction,
@@ -77,6 +79,11 @@ class FragmentMetadata:
         The row created at version metadata, if any.
     last_updated_at_version_meta : Optional[RowDatasetVersionMeta]
         The row last updated at version metadata, if any.
+    overlays : List[LanceOperation.DataOverlayFile]
+        The data overlay files layered over this fragment's base data, if any.
+        Overlays are created via :class:`LanceOperation.DataOverlay`; they are
+        carried here so they survive operations that round-trip fragment
+        metadata (e.g. a manual ``Delete``, ``Update``, or ``Merge`` commit).
     """
 
     id: int
@@ -86,6 +93,7 @@ class FragmentMetadata:
     row_id_meta: Optional[RowIdMeta] = None
     created_at_version_meta: Optional[RowDatasetVersionMeta] = None
     last_updated_at_version_meta: Optional[RowDatasetVersionMeta] = None
+    overlays: List["LanceOperation.DataOverlayFile"] = field(default_factory=list)
 
     @property
     def num_deletions(self) -> int:
@@ -109,12 +117,25 @@ class FragmentMetadata:
 
     def to_json(self) -> dict:
         """Get this as a simple JSON-serializable dictionary."""
-        files = [asdict(f) for f in self.files]
-        for f in files:
-            f["path"] = f.pop("_path")
+
+        def _data_file_to_json(f: DataFile) -> dict:
+            d = asdict(f)
+            d["path"] = d.pop("_path")
+            return d
+
+        files = [_data_file_to_json(f) for f in self.files]
+        overlays = [
+            dict(
+                data_file=_data_file_to_json(o.data_file),
+                offsets=o.offsets,
+                committed_version=o.committed_version,
+            )
+            for o in self.overlays
+        ]
         return dict(
             id=self.id,
             files=files,
+            overlays=overlays,
             physical_rows=self.physical_rows,
             deletion_file=(
                 self.deletion_file.asdict() if self.deletion_file is not None else None
@@ -158,6 +179,20 @@ class FragmentMetadata:
                 json.dumps(last_updated_at_version_meta)
             )
 
+        overlays = []
+        overlays_json = json_data.get("overlays")
+        if overlays_json:
+            from .dataset import LanceOperation
+
+            overlays = [
+                LanceOperation.DataOverlayFile(
+                    data_file=DataFile(**o["data_file"]),
+                    offsets=o["offsets"],
+                    committed_version=o.get("committed_version"),
+                )
+                for o in overlays_json
+            ]
+
         return FragmentMetadata(
             id=json_data["id"],
             files=[DataFile(**f) for f in json_data["files"]],
@@ -166,6 +201,7 @@ class FragmentMetadata:
             row_id_meta=row_id_meta,
             created_at_version_meta=created_at_version_meta,
             last_updated_at_version_meta=last_updated_at_version_meta,
+            overlays=overlays,
         )
 
 
@@ -965,6 +1001,24 @@ class LanceFragment(pa.dataset.Fragment):
             return None
         return raw_fragment.metadata()
 
+    def delete_rows(self, offsets: "Iterable[int]") -> FragmentMetadata | None:
+        """Delete rows by their local (within-fragment) physical row offsets.
+
+        Adds the given 0-based offsets to this fragment's deletion file and
+        returns a new fragment, or None if no rows are left. Unlike
+        :meth:`delete`, this deletes exactly the supplied rows without
+        re-evaluating a SQL predicate -- useful when the caller already knows
+        which rows to delete (e.g. offsets collected from a prior scan).
+
+        .. warning::
+
+            Internal API. This method is not intended to be used by end users.
+        """
+        raw_fragment = self._fragment.delete_rows([int(o) for o in offsets])
+        if raw_fragment is None:
+            return None
+        return raw_fragment.metadata()
+
     @property
     def schema(self) -> pa.Schema:
         """Return the schema of this fragment."""
@@ -1010,8 +1064,11 @@ if TYPE_CHECKING:
         storage_options: Optional[Dict[str, str]] = None,
         enable_stable_row_ids: bool = False,
         target_bases: Optional[List[str]] = None,
+        target_all_bases: Optional[bool] = None,
         initial_bases: Optional[List["DatasetBasePath"]] = None,
         base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
+        external_blob_mode: Literal["reference", "ingest"] = "reference",
+        allow_external_blob_outside_bases: bool = False,
         namespace_client: Optional[LanceNamespace] = None,
         table_id: Optional[List[str]] = None,
     ) -> Transaction: ...
@@ -1033,8 +1090,11 @@ if TYPE_CHECKING:
         storage_options: Optional[Dict[str, str]] = None,
         enable_stable_row_ids: bool = False,
         target_bases: Optional[List[str]] = None,
+        target_all_bases: Optional[bool] = None,
         initial_bases: Optional[List["DatasetBasePath"]] = None,
         base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
+        external_blob_mode: Literal["reference", "ingest"] = "reference",
+        allow_external_blob_outside_bases: bool = False,
         namespace_client: Optional[LanceNamespace] = None,
         table_id: Optional[List[str]] = None,
     ) -> List[FragmentMetadata]: ...
@@ -1056,8 +1116,11 @@ def write_fragments(
     storage_options: Optional[Dict[str, str]] = None,
     enable_stable_row_ids: bool = False,
     target_bases: Optional[List[str]] = None,
+    target_all_bases: Optional[bool] = None,
     initial_bases: Optional[List["DatasetBasePath"]] = None,
     base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
+    external_blob_mode: Literal["reference", "ingest"] = "reference",
+    allow_external_blob_outside_bases: bool = False,
     namespace_client: Optional[LanceNamespace] = None,
     table_id: Optional[List[str]] = None,
 ) -> List[FragmentMetadata] | Transaction:
@@ -1124,6 +1187,11 @@ def write_fragments(
         **CREATE mode**: References must match bases in `initial_bases`
         **APPEND/OVERWRITE modes**: References must match bases in the
         existing manifest
+    target_all_bases : bool, optional
+        Write new data files round-robin across every base registered in the
+        manifest, resolved at execution time. When True, the dataset's
+        primary storage participates as the first slot. Cannot be combined
+        with `target_bases`.
     initial_bases : list of DatasetBasePath, optional
         Base paths to register when creating a new dataset (CREATE mode only).
 
@@ -1142,6 +1210,18 @@ def write_fragments(
         top-level ``storage_options`` is used as a fallback. If ``dataset_uri``
         is a LanceDataset and this is omitted, the dataset's base store params
         are inherited.
+    external_blob_mode: {"reference", "ingest"}, default "reference"
+        How external blob URIs are handled on write.
+
+        - ``"reference"`` stores the URI as an external blob reference.
+        - ``"ingest"`` reads the external bytes during write and stores them in
+          Lance-managed storage using the normal inline / packed / dedicated
+          thresholds.
+    allow_external_blob_outside_bases: bool, default False
+        If False, external blob URIs must map to a registered non-dataset-root
+        base path. If True, external blob URIs outside registered bases are
+        allowed. Only valid when ``external_blob_mode="reference"``. Setting
+        this to True with ``"ingest"`` mode raises an error.
     namespace_client : optional, LanceNamespace
         A namespace client for automatic credential refresh. When provided with
         `table_id`, a storage options provider will be created automatically to
@@ -1217,8 +1297,11 @@ def write_fragments(
         table_id=table_id,
         enable_stable_row_ids=enable_stable_row_ids,
         target_bases=target_bases,
+        target_all_bases=target_all_bases,
         initial_bases=initial_bases,
         base_store_params=base_store_params,
+        external_blob_mode=external_blob_mode,
+        allow_external_blob_outside_bases=allow_external_blob_outside_bases,
     )
 
 

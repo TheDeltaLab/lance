@@ -3,8 +3,8 @@
 
 use async_cell::sync::AsyncCell;
 use futures::Future;
-use lance_core::utils::tokio::spawn_in_current_span;
 use std::sync::Arc;
+use tracing::Instrument;
 
 /// An async background task whose output can be shared across threads (via cloning)
 ///
@@ -47,10 +47,13 @@ impl<T: Clone> SharedPrerequisite<T> {
     {
         let cell = AsyncCell::<std::result::Result<T, String>>::shared();
         let dst = cell.clone();
-        spawn_in_current_span(async move {
-            let res = future.await;
-            dst.set(res.map_err(|err| err.to_string()));
-        });
+        tokio::spawn(
+            (async move {
+                let res = future.await;
+                dst.set(res.map_err(|err| err.to_string()));
+            })
+            .in_current_span(),
+        );
         Arc::new(Self(cell))
     }
 }
@@ -71,7 +74,7 @@ mod tests {
         let mut tasks = Vec::with_capacity(10);
         for _ in 0..10 {
             let instance = prereq.clone();
-            tasks.push(spawn_in_current_span(async move {
+            tasks.push(tokio::spawn(async move {
                 instance.wait_ready().await.unwrap();
                 assert_eq!(instance.get_ready(), 7_u32);
             }));
@@ -87,7 +90,7 @@ mod tests {
         let mut tasks = Vec::with_capacity(10);
         for _ in 0..10 {
             let instance = prereq.clone();
-            tasks.push(spawn_in_current_span(async move {
+            tasks.push(tokio::spawn(async move {
                 let err = instance.wait_ready().await.unwrap_err();
                 assert!(err.to_string().contains("xyz"));
                 assert!(err.to_string().contains("task failed"));

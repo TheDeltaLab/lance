@@ -1,19 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use crate::frag_reuse::FragReuseIndex;
 use crate::metrics::{MetricsCollector, NoOpMetricsCollector};
 use crate::scalar::expression::{GeoQueryParser, ScalarQueryParser};
 use crate::scalar::lance_format::LanceIndexStore;
 use crate::scalar::registry::{
-    ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
+    BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
 };
 use crate::scalar::rtree::sort::Sorter;
 use crate::scalar::{
-    AnyQuery, BuiltinIndexType, CreatedIndex, GeoQuery, IndexReader, IndexStore, IndexWriter,
-    ScalarIndex, ScalarIndexParams, SearchResult, UpdateCriteria,
+    AnyQuery, BuiltinIndexType, CreatedIndex, GeoQuery, IndexFile, IndexReader, IndexStore,
+    IndexWriter, RowIdRemapper, ScalarIndex, ScalarIndexParams, SearchResult, UpdateCriteria,
 };
-use crate::vector::VectorIndex;
 use crate::{Index, IndexType, pb};
 use arrow_array::UInt32Array;
 use arrow_array::cast::AsArray;
@@ -24,7 +22,6 @@ use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_common::DataFusionError;
-use deepsize::DeepSizeOf;
 use futures::future::BoxFuture;
 use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt, stream};
 use geoarrow_array::array::{RectArray, from_arrow_array};
@@ -33,7 +30,9 @@ use geoarrow_array::{GeoArrowArray, GeoArrowArrayAccessor, IntoArrow};
 use geoarrow_schema::{Dimension, RectType};
 use lance_arrow::RecordBatchExt;
 use lance_core::cache::{CacheKey, LanceCache, WeakLanceCache};
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::utils::tempfile::TempDir;
 use lance_core::{Error, ROW_ID, Result};
 use lance_datafusion::chunker::chunk_concat_stream;
@@ -235,8 +234,8 @@ pub enum RTreeCacheKey {
 pub struct RTreeCacheValue(Arc<RecordBatch>);
 
 impl DeepSizeOf for RTreeCacheValue {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
-        self.0.get_array_memory_size()
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        self.0.deep_size_of_children(context)
     }
 }
 
@@ -259,7 +258,7 @@ impl CacheKey for RTreeCacheKey {
 pub struct RTreeIndex {
     pub(crate) metadata: Arc<RTreeMetadata>,
     store: Arc<dyn IndexStore>,
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     index_cache: WeakLanceCache,
     pages_reader: Arc<dyn IndexReader>,
     nulls_reader: Arc<dyn IndexReader>,
@@ -277,7 +276,7 @@ impl std::fmt::Debug for RTreeIndex {
 impl RTreeIndex {
     pub async fn load(
         store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
         let pages_reader = store.open_index_file(RTREE_PAGES_NAME).await?;
@@ -430,7 +429,7 @@ impl RTreeIndex {
 }
 
 impl DeepSizeOf for RTreeIndex {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         let mut total_size = 0;
 
         total_size += self.store.deep_size_of_children(context);
@@ -447,12 +446,6 @@ impl Index for RTreeIndex {
 
     fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
         self
-    }
-
-    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
-        Err(Error::not_supported_source(
-            "RTreeIndex is not vector index".into(),
-        ))
     }
 
     fn statistics(&self) -> Result<serde_json::Value> {
@@ -551,7 +544,7 @@ impl ScalarIndex for RTreeIndex {
 
     async fn remap(
         &self,
-        _mapping: &HashMap<u64, Option<u64>>,
+        _mapping: &RowAddrRemap,
         _dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
         Err(Error::invalid_input_source(
@@ -593,7 +586,7 @@ impl ScalarIndex for RTreeIndex {
             num_items: self.metadata.num_items + stats.num_items,
         };
 
-        RTreeIndexPlugin::train_rtree_index(
+        let files = RTreeIndexPlugin::train_rtree_index(
             merged_bbox_data,
             merge_stats,
             self.metadata.page_size,
@@ -604,7 +597,7 @@ impl ScalarIndex for RTreeIndex {
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pb::RTreeIndexDetails::default())?,
             index_version: RTREE_INDEX_VERSION,
-            files: Some(dest_store.list_files_with_sizes().await?),
+            files,
         })
     }
 
@@ -830,7 +823,7 @@ impl RTreeIndexPlugin {
         total_bbox: BoundingBox,
         store: &dyn IndexStore,
         page_size: u32,
-    ) -> Result<()> {
+    ) -> Result<IndexFile> {
         let mut page_idx: u64 = 0;
         let mut writer = store
             .new_index_file(RTREE_PAGES_NAME, RTREE_PAGE_SCHEMA.clone())
@@ -868,12 +861,13 @@ impl RTreeIndexPlugin {
             .finish_with_metadata(
                 RTreeMetadata::new(page_size, page_idx, num_items, total_bbox).into_map(),
             )
-            .await?;
-
-        Ok(())
+            .await
     }
 
-    pub async fn write_nulls(store: &dyn IndexStore, null_map: RowAddrTreeMap) -> Result<()> {
+    pub async fn write_nulls(
+        store: &dyn IndexStore,
+        null_map: RowAddrTreeMap,
+    ) -> Result<IndexFile> {
         let mut writer = store
             .new_index_file(RTREE_NULLS_NAME, RTREE_NULLS_SCHEMA.clone())
             .await?;
@@ -893,12 +887,12 @@ impl RTreeIndexPlugin {
         stats: BboxStreamStats,
         page_size: u32,
         store: &dyn IndexStore,
-    ) -> Result<()> {
+    ) -> Result<Vec<IndexFile>> {
         // new sorted stream
         let sorter = HilbertSorter::new(stats.total_bbox);
         let sorted_data = sorter.sort(bbox_data).await?;
 
-        Self::write_index(
+        let page_file = Self::write_index(
             sorted_data,
             stats.num_items,
             stats.total_bbox,
@@ -907,18 +901,14 @@ impl RTreeIndexPlugin {
         )
         .await?;
 
-        Self::write_nulls(store, stats.null_map).await?;
+        let nulls_file = Self::write_nulls(store, stats.null_map).await?;
 
-        Ok(())
+        Ok(vec![page_file, nulls_file])
     }
 }
 
 #[async_trait]
-impl ScalarIndexPlugin for RTreeIndexPlugin {
-    fn name(&self) -> &str {
-        "RTree"
-    }
-
+impl BasicTrainer for RTreeIndexPlugin {
     fn new_training_request(
         &self,
         params: &str,
@@ -964,13 +954,24 @@ impl ScalarIndexPlugin for RTreeIndexPlugin {
             Self::process_and_analyze_bbox_stream(bbox_data, page_size, spill_store.clone())
                 .await?;
 
-        Self::train_rtree_index(bbox_data, stats, page_size, index_store).await?;
+        let files = Self::train_rtree_index(bbox_data, stats, page_size, index_store).await?;
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pb::RTreeIndexDetails::default())?,
             index_version: RTREE_INDEX_VERSION,
-            files: Some(index_store.list_files_with_sizes().await?),
+            files,
         })
+    }
+}
+
+#[async_trait]
+impl ScalarIndexPlugin for RTreeIndexPlugin {
+    fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
+        Some(self)
+    }
+
+    fn name(&self) -> &str {
+        "RTree"
     }
 
     fn provides_exact_answer(&self) -> bool {
@@ -996,7 +997,7 @@ impl ScalarIndexPlugin for RTreeIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(RTreeIndex::load(index_store, frag_reuse_index, cache).await? as Arc<dyn ScalarIndex>)

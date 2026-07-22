@@ -6,8 +6,8 @@ use std::ops::Range;
 
 use crate::datatypes::{Fields, FieldsWithMeta};
 use crate::format::pb;
-use deepsize::DeepSizeOf;
 use lance_core::datatypes::Schema;
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use lance_io::traits::ProtoStruct;
 
@@ -62,10 +62,10 @@ impl TryFrom<pb::Metadata> for Metadata {
             manifest_position: Some(m.manifest_position as usize),
             stats_metadata: if let Some(stats_meta) = m.statistics {
                 Some(StatisticsMetadata {
-                    schema: Schema::from(FieldsWithMeta {
+                    schema: Schema::try_from(FieldsWithMeta {
                         fields: Fields(stats_meta.schema),
                         metadata: Default::default(),
-                    }),
+                    })?,
                     leaf_field_ids: stats_meta.fields,
                     page_table_position: stats_meta.page_table_position as usize,
                 })

@@ -148,6 +148,7 @@ async fn setup_dataset(schema: &Arc<ArrowSchema>, name: &str, dataset_prefix: &s
         reader,
         &dataset_uri,
         Some(WriteParams {
+            data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
             mode: lance::dataset::WriteMode::Create,
             ..Default::default()
         }),
@@ -178,7 +179,6 @@ async fn populate_shard_wal(
     let dataset = Dataset::open(dataset_uri).await.unwrap();
     let mut config = ShardWriterConfig::new(shard_id);
     config.durable_write = true;
-    config.sync_indexed_write = false;
     let writer = dataset.mem_wal_writer(shard_id, config).await.unwrap();
 
     for i in 0..num_entries {

@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::cleanup_data_fragments;
 use super::retry::{RetryConfig, RetryExecutor, execute_with_retry};
 use super::{CommitBuilder, WriteParams, write_fragments_internal};
 use crate::dataset::rowids::get_row_id_index;
@@ -24,6 +25,7 @@ use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue;
 use futures::StreamExt;
 use lance_arrow::RecordBatchExt;
+use lance_core::datatypes::BlobHandling;
 use lance_core::error::{InvalidInputSnafu, box_error};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD, ROW_OFFSET_FIELD};
@@ -32,6 +34,16 @@ use lance_select::RowAddrTreeMap;
 use lance_table::format::{Fragment, RowIdMeta};
 use roaring::RoaringTreemap;
 use snafu::ResultExt;
+
+/// Collect a field id and all of its descendant field ids (pre-order). A struct
+/// column update rewrites the whole subtree, so an index on any descendant must be
+/// treated as modified.
+fn collect_subtree_field_ids(field: &lance_core::datatypes::Field, out: &mut Vec<u32>) {
+    out.push(field.id as u32);
+    for child in &field.children {
+        collect_subtree_field_ids(child, out);
+    }
+}
 
 /// Build an update operation.
 ///
@@ -269,6 +281,7 @@ impl UpdateJob {
     async fn execute_impl(self) -> Result<UpdateData> {
         let mut scanner = self.dataset.scan();
         scanner.with_row_id();
+        scanner.blob_handling(BlobHandling::AllBinary);
 
         if let Some(expr) = &self.condition {
             scanner.filter_expr(expr.clone());
@@ -351,7 +364,20 @@ impl UpdateJob {
         // Apply deletions
         let row_id_index = get_row_id_index(&self.dataset).await?;
         let row_addrs = removed_row_ids.row_addrs(row_id_index.as_deref());
-        let (old_fragments, removed_fragment_ids) = self.apply_deletions(&row_addrs).await?;
+        let deletions_result = self.apply_deletions(&row_addrs).await;
+        let (old_fragments, removed_fragment_ids) = match deletions_result {
+            Ok(v) => v,
+            Err(e) => {
+                cleanup_data_fragments(
+                    &self.dataset.object_store,
+                    &self.dataset.base,
+                    None,
+                    &new_fragments,
+                )
+                .await;
+                return Err(e);
+            }
+        };
         let affected_rows = RowAddrTreeMap::from(row_addrs.as_ref().clone());
 
         let num_updated_rows = new_fragments
@@ -373,10 +399,14 @@ impl UpdateJob {
         dataset: Arc<Dataset>,
         update_data: UpdateData,
     ) -> Result<UpdateResult> {
+        // Updated columns are top-level (nested references are rejected by `set`), but a
+        // struct-column update rewrites all of its descendants. Collect the full field
+        // subtree so an index on a nested child field is recognized as modified and not
+        // wrongly extended over the rewritten fragment.
         let mut fields_for_preserving_frag_bitmap = Vec::new();
         for column_name in self.updates.keys() {
-            if let Ok(field_id) = dataset.schema().field_id(column_name) {
-                fields_for_preserving_frag_bitmap.push(field_id as u32);
+            if let Some(field) = dataset.schema().field(column_name) {
+                collect_subtree_field_ids(field, &mut fields_for_preserving_frag_bitmap);
             }
         }
 
@@ -1579,5 +1609,169 @@ mod tests {
                 assert_eq!(updated_names.value(i), "foo");
             }
         }
+    }
+
+    fn count_data_files(base_dir: &str) -> usize {
+        let data_dir = std::path::Path::new(base_dir).join("data");
+        if !data_dir.exists() {
+            return 0;
+        }
+        std::fs::read_dir(data_dir)
+            .unwrap()
+            .filter(|e| e.as_ref().unwrap().path().is_file())
+            .count()
+    }
+
+    /// Site 4 in PR #6320: when `UpdateJob::apply_deletions` fails after the new
+    /// rewrite fragments have been written, those new data files must be cleaned up.
+    #[tokio::test]
+    async fn test_update_cleans_up_data_on_apply_deletions_failure() {
+        use crate::utils::test::FailingProxyStore;
+        use lance_io::object_store::ObjectStoreParams;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..30)),
+                Arc::new(StringArray::from_iter_values(std::iter::repeat_n(
+                    "foo", 30,
+                ))),
+            ],
+        )
+        .unwrap();
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        // Prefix `/` so Windows drive letters (e.g. `C:`) don't get parsed as
+        // the URL authority.
+        let path_prefix = if test_uri.starts_with('/') { "" } else { "/" };
+        let routed_uri = format!("file-object-store://{path_prefix}{test_uri}");
+
+        let write_params = WriteParams {
+            max_rows_per_file: 10,
+            data_storage_version: Some(LanceFileVersion::V2_1),
+            ..Default::default()
+        };
+        let batches = RecordBatchIterator::new([Ok(batch)], schema.clone());
+        Dataset::write(batches, &routed_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        let baseline_files = count_data_files(test_uri);
+        assert!(baseline_files > 0);
+
+        // Fail writes to `_deletions/`: this is where `apply_deletions` writes
+        // the new deletion file. The rewrite fragments (in `data/`) are written
+        // earlier and should be successfully created, then cleaned up on failure.
+        let failing = Arc::new(FailingProxyStore::new());
+        failing.fail_when("put", "_deletions", "injected deletions failure");
+        failing.fail_when("put_multipart", "_deletions", "injected deletions failure");
+
+        let dataset = DatasetBuilder::from_uri(&routed_uri)
+            .with_read_params(ReadParams {
+                store_options: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(failing.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .load()
+            .await
+            .unwrap();
+
+        let result = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("id < 5")
+            .unwrap()
+            .set("name", "'bar'")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await;
+
+        assert!(
+            result.is_err(),
+            "Update should fail when deletion-file write fails"
+        );
+
+        assert_eq!(
+            count_data_files(test_uri),
+            baseline_files,
+            "Rewritten data files should be cleaned up on apply_deletions failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_with_blob() {
+        use arrow_array::LargeBinaryArray;
+        use arrow_schema::Field;
+        use lance_arrow::BLOB_META_KEY;
+
+        let test_dir = TempStrDir::default();
+        let blob_meta = HashMap::from([(BLOB_META_KEY.to_string(), "true".to_string())]);
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("blobs", DataType::LargeBinary, true).with_metadata(blob_meta),
+            Field::new("id", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(LargeBinaryArray::from(vec![
+                    Some(b"foo".as_slice()),
+                    Some(b"bar".as_slice()),
+                    Some(b"baz".as_slice()),
+                ])),
+                Arc::new(Int64Array::from(vec![0, 1, 2])),
+            ],
+        )
+        .unwrap();
+
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let dataset = Dataset::write(
+            reader,
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Perform an update: update the "blobs" column where id = 1
+        let dataset = Arc::new(dataset);
+        let updated_dataset = UpdateBuilder::new(dataset)
+            .update_where("id = 1")
+            .unwrap()
+            .set("blobs", "arrow_cast('updated_bar', 'LargeBinary')")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset;
+
+        // Verify the updated value
+        let mut scanner = updated_dataset.scan();
+        // Read as binary to assert actual value
+        scanner.blob_handling(BlobHandling::AllBinary);
+        let batches = scanner.try_into_batch().await.unwrap();
+        let blobs = batches.column_by_name("blobs").unwrap().as_binary::<i64>();
+        let ids = batches
+            .column_by_name("id")
+            .unwrap()
+            .as_primitive::<Int64Type>();
+
+        // Find the index of id = 1
+        let idx = ids.values().iter().position(|&x| x == 1).unwrap();
+        assert_eq!(blobs.value(idx), b"updated_bar");
+
+        let idx_foo = ids.values().iter().position(|&x| x == 0).unwrap();
+        assert_eq!(blobs.value(idx_foo), b"foo");
     }
 }

@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+#[cfg(test)]
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::sync::Arc;
 
-use deepsize::DeepSizeOf;
 use lance_core::Result;
+use lance_core::deepsize::DeepSizeOf;
 use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_index::{IndexParams, IndexType, vector::VectorIndex};
+use uuid::Uuid;
 
 use crate::Dataset;
 
@@ -35,7 +38,7 @@ pub trait VectorIndexExtension: IndexExtension {
         // if we wrap into an Arc, the mutable reference is lost
         dataset: &Dataset,
         column: &str,
-        uuid: &str,
+        uuid: &Uuid,
         params: &dyn IndexParams,
     ) -> Result<()>;
 
@@ -44,7 +47,7 @@ pub trait VectorIndexExtension: IndexExtension {
         &self,
         dataset: Arc<Dataset>,
         column: &str,
-        uuid: &str,
+        uuid: &Uuid,
         reader: PreviousFileReader,
     ) -> Result<Arc<dyn VectorIndex>>;
 }
@@ -61,7 +64,6 @@ mod test {
 
     use std::{
         any::Any,
-        collections::HashMap,
         sync::{Arc, atomic::AtomicBool},
     };
 
@@ -69,7 +71,7 @@ mod test {
     use arrow_array::{Float32Array, RecordBatch, UInt32Array};
     use arrow_schema::Schema;
     use datafusion::execution::SendableRecordBatchStream;
-    use deepsize::DeepSizeOf;
+    use lance_core::deepsize::DeepSizeOf;
     use lance_file::previous::writer::{
         FileWriter as PreviousFileWriter, FileWriterOptions as PreviousFileWriterOptions,
     };
@@ -95,7 +97,7 @@ mod test {
     struct MockIndex;
 
     impl DeepSizeOf for MockIndex {
-        fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
             0
         }
     }
@@ -108,10 +110,6 @@ mod test {
 
         fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
             self
-        }
-
-        fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
-            Ok(self)
         }
 
         async fn prewarm(&self) -> Result<()> {
@@ -185,7 +183,7 @@ mod test {
             unimplemented!()
         }
 
-        async fn remap(&mut self, _: &HashMap<u64, Option<u64>>) -> Result<()> {
+        async fn remap(&mut self, _: &RowAddrRemap) -> Result<()> {
             Ok(())
         }
 
@@ -230,7 +228,7 @@ mod test {
     }
 
     impl DeepSizeOf for MockIndexExtension {
-        fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
             todo!()
         }
     }
@@ -259,7 +257,7 @@ mod test {
             &self,
             dataset: &Dataset,
             _column: &str,
-            uuid: &str,
+            uuid: &Uuid,
             _params: &dyn IndexParams,
         ) -> Result<()> {
             let store = dataset.object_store.clone();
@@ -305,7 +303,7 @@ mod test {
             &self,
             _dataset: Arc<Dataset>,
             _column: &str,
-            _uuid: &str,
+            _uuid: &Uuid,
             _reader: PreviousFileReader,
         ) -> Result<Arc<dyn VectorIndex>> {
             self.load_index_called
@@ -391,7 +389,7 @@ mod test {
         let idx = ds_without_extension.load_indices().await.unwrap();
         assert_eq!(idx.len(), 1);
         // get the index uuid
-        let index_uuid = idx.first().unwrap().uuid.to_string();
+        let index_uuid = idx.first().unwrap().uuid;
 
         // trying to open the index should fail as there is no extension loader
         assert!(

@@ -1737,6 +1737,9 @@ impl Scanner {
     /// If Some, then the resulting stream will be sorted according to the given ordering.
     /// This may increase the latency of the first result since all data must be read before
     /// the first batch can be returned.
+    /// Full-text search sorts all matching candidates before applying the scan's limit and
+    /// offset. An explicit [`FullTextSearchQuery::limit`] still bounds the candidate set
+    /// by BM25 score before this ordering is applied.
     pub fn order_by(&mut self, ordering: Option<Vec<ColumnOrdering>>) -> Result<&mut Self> {
         if let Some(ordering) = &ordering {
             if ordering.is_empty() {
@@ -3302,7 +3305,9 @@ impl Scanner {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let columns = query.columns();
         let mut params = query.params();
-        if params.limit.is_none() {
+        // A BM25 top-k can discard rows that come first in the requested column order.
+        // Only infer a candidate limit when the final order remains the FTS score order.
+        if params.limit.is_none() && self.ordering.is_none() {
             let search_limit = match (self.limit, self.offset) {
                 (Some(limit), Some(offset)) => Some((limit + offset) as usize),
                 (Some(limit), None) => Some(limit as usize),
@@ -3424,10 +3429,7 @@ impl Scanner {
                     },
                 };
 
-                Arc::new(
-                    SortExec::new([sort_expr].into(), fts_node)
-                        .with_fetch(self.limit.map(|l| l as usize)),
-                )
+                Arc::new(SortExec::new([sort_expr].into(), fts_node).with_fetch(params.limit))
             }
             FtsQuery::Boolean(query) => {
                 // TODO: rewrite the query for better performance
@@ -5358,6 +5360,7 @@ mod test {
     use arrow_array::{
         ArrayRef, BooleanArray, FixedSizeListArray, Float16Array, Int32Array, LargeStringArray,
         PrimitiveArray, RecordBatchIterator, StringArray, StructArray, UInt8Array, UInt32Array,
+        record_batch,
     };
 
     use arrow_ord::sort::sort_to_indices;
@@ -5374,6 +5377,7 @@ mod test {
     use lance_file::version::LanceFileVersion;
     use lance_index::optimize::OptimizeOptions;
     use lance_index::scalar::inverted::query::{MatchQuery, PhraseQuery};
+    use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::PQBuildParams;
@@ -12388,6 +12392,103 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         scanner
             .full_text_search(FullTextSearchQuery::new("4".into()))
             .unwrap();
+        limit_offset_equivalency_test(&scanner).await;
+    }
+
+    #[rstest]
+    #[case::single_column(vec!["summary".to_owned()])]
+    #[case::multiple_columns(vec!["summary".to_owned(), "content".to_owned()])]
+    #[tokio::test]
+    async fn test_fts_pagination_with_ordering(
+        #[case] columns: Vec<String>,
+        #[values(false, true)] ordered: bool,
+        #[values(false, true)] unindexed_append: bool,
+    ) {
+        // Descending id order reverses the summary column's BM25 document-length order.
+        // The columns rank different rows first, exercising deduplication and the
+        // candidate budget on their union as well as the per-column budgets.
+        let mut texts = (0..6)
+            .map(|i| Some(format!("needle {}", "filler ".repeat(i * 20))))
+            .collect::<Vec<_>>();
+        let mut other_texts = (0..6)
+            .map(|i| Some(format!("needle {}", "filler ".repeat((5 - i) * 23 + 7))))
+            .collect::<Vec<_>>();
+        texts.extend([None, Some("unrelated".to_owned())]);
+        other_texts.extend([None, Some("unrelated".to_owned())]);
+        let batch = record_batch!(
+            ("id", Int32, (0..8).collect::<Vec<_>>()),
+            ("summary", Utf8, texts),
+            ("content", Utf8, other_texts)
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let indexed_rows = if unindexed_append {
+            4
+        } else {
+            batch.num_rows()
+        };
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch.slice(0, indexed_rows))], schema.clone()),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        for column in ["summary", "content"] {
+            dataset
+                .create_index(
+                    &[column],
+                    IndexType::Inverted,
+                    None,
+                    &InvertedIndexParams::default(),
+                    true,
+                )
+                .await
+                .unwrap();
+        }
+        if unindexed_append {
+            dataset
+                .append(
+                    RecordBatchIterator::new(vec![Ok(batch.slice(4, 4))], schema),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        let query = FullTextSearchQuery::new("needle".to_owned())
+            .with_columns(&columns)
+            .unwrap();
+        let mut scanner = dataset.scan();
+        scanner
+            .full_text_search(query.clone())
+            .unwrap()
+            .filter("id != 2")
+            .unwrap()
+            .prefilter(true)
+            .project(&["id"])
+            .unwrap();
+        if ordered {
+            scanner
+                .order_by(Some(vec![ColumnOrdering::desc_nulls_last("id".to_owned())]))
+                .unwrap();
+        }
+        let full_results = scanner.try_into_batch().await.unwrap();
+        assert_eq!(full_results.num_rows(), 5);
+        if ordered {
+            assert_eq!(
+                full_results["id"].as_primitive::<Int32Type>().values(),
+                &[5, 4, 3, 1, 0]
+            );
+        }
+        limit_offset_equivalency_test(&scanner).await;
+
+        // An explicit FTS candidate budget is independent of the final page size.
+        scanner.full_text_search(query.limit(Some(3))).unwrap();
+        assert_eq!(scanner.try_into_batch().await.unwrap().num_rows(), 3);
         limit_offset_equivalency_test(&scanner).await;
     }
 
